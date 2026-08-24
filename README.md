@@ -1,12 +1,23 @@
 # PulseFlow SaaS
 
-MVP funcional de um CRM de follow-up automático. A interface é estática e sem dependências; há também uma API local em Python para desenvolvimento, webhooks e testes de integração.
+MVP funcional de uma camada de execução de follow-up. O PulseFlow não pretende substituir o CRM: ele conecta canais e sistemas existentes para garantir que cada lead receba a próxima ação certa, no tempo certo e com contexto.
+
+## Princípio do produto
+
+- O Pipeline organiza o trabalho de follow-up, sem duplicar o cadastro completo do CRM;
+- Cada coluna tem SLA, IA observadora, IA operadora e automações independentes;
+- A IA observadora analisa conversas e notas, mas não envia mensagens;
+- A IA operadora sugere, executa com aprovação ou opera automaticamente, conforme a autonomia escolhida;
+- Notas, valor do contrato e próxima ação mantêm apenas o contexto necessário para executar o acompanhamento;
+- CRM, WhatsApp, VoIP e agenda continuam sendo integrados como fontes e destinos externos.
 
 ## O que está implementado
 
 - Login/cadastro de demonstração e período grátis;
-- Dashboard, pipeline drag-and-drop, SLA por coluna e criação de colunas;
+- Dashboard operacional com parâmetros da plataforma, pipeline drag-and-drop e colunas totalmente configuráveis;
+- IA observadora, IA operadora e conjunto de automações configuráveis por coluna;
 - Leads com origem, interesse, nicho, faturamento, notas e motivo de descarte;
+- Área de notas, produto, preço do contrato, status comercial e próxima ação acessível diretamente pelo Pipeline;
 - Conversas em estilo WhatsApp, templates, registro de ligação obrigatório antes da primeira mensagem e respostas simuladas;
 - Cadência configurável por horas/dias, automação por etapa e recuperação contextual;
 - Lembretes, remarketing/abandonados, agente de IA por nicho, administração e planos;
