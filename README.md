@@ -18,6 +18,8 @@ MVP funcional de uma camada de execução de follow-up. O PulseFlow não pretend
 - IA observadora, IA operadora e conjunto de automações configuráveis por coluna;
 - Leads com origem, interesse, nicho, faturamento, notas e motivo de descarte;
 - Área de notas, produto, preço do contrato, status comercial e próxima ação acessível diretamente pelo Pipeline;
+- Coach de vendas que consolida mensagens, notas e ligações para estimar consciência, momento de compra, perguntas de descoberta, retomadas e condução para reunião;
+- Pipeline de pós-venda com apenas IA observadora, sinais de conversas diretas e grupos autorizados, saúde do cliente, risco e oportunidade de expansão;
 - Conversas em estilo WhatsApp, templates, registro de ligação obrigatório antes da primeira mensagem e respostas simuladas;
 - Cadência configurável por horas/dias, automação por etapa e recuperação contextual;
 - Lembretes, remarketing/abandonados, agente de IA por nicho, administração e planos;
