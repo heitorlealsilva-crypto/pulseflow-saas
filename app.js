@@ -246,6 +246,51 @@ bind=function(){
 render=function(){if(!state.logged)return login();const page={dashboard,pipeline,conversation,coach:salesCoachPage,postsale:postSalePage,'whatsapp-api':whatsappApiPage,automation,reminders,ai:aiPage,settings,admin,billing}[state.page]||dashboard;app.innerHTML=page();bind()};
 render();
 
+/* Personalização de lançamento do plano Base por nicho. */
+const nichePlaybooks={
+  'Barbearia':{first:['Oi, {nome}! Vi que você quer cuidar do visual. Está buscando corte, barba ou um pacote completo?','Olá, {nome}! Tenho alguns horários nesta semana. Qual período funciona melhor para você?'],follow:['{nome}, quer que eu separe um horário para você antes de fechar a agenda?','Passando para confirmar: prefere atendimento durante a semana ou no sábado?'],close:['Posso reservar seu melhor horário agora. Manhã ou tarde?','Quer começar com um atendimento avulso ou conhecer nosso plano recorrente?']},
+  'Salão de beleza':{first:['Oi, {nome}! Qual resultado você gostaria de alcançar no cabelo?','Olá, {nome}! Seu interesse é em corte, cor, tratamento ou transformação completa?'],follow:['{nome}, posso indicar o serviço ideal se você me contar como está seu cabelo hoje.','Quer que eu verifique um horário com a profissional mais indicada para você?'],close:['Tenho um horário compatível com o que você procura. Posso reservar?','Quer confirmar sua avaliação para montarmos o melhor plano de cuidados?']},
+  'Clínica':{first:['Olá, {nome}! Para orientar você corretamente, qual é sua principal necessidade hoje?','Oi, {nome}! Você já realizou algum tratamento ou esta será sua primeira avaliação?'],follow:['{nome}, ficou alguma dúvida que eu possa esclarecer antes de agendarmos?','Posso verificar um horário tranquilo para sua avaliação inicial.'],close:['Faz sentido reservarmos sua avaliação para definir o próximo passo com segurança?','Tenho disponibilidade nesta semana. Qual período é melhor para você?']},
+  'Loja':{first:['Oi, {nome}! O que você está procurando e para quando precisa?','Olá, {nome}! Posso ajudar a escolher a opção com melhor custo-benefício para você.'],follow:['{nome}, quer que eu compare as opções que mais combinam com sua necessidade?','Ainda posso separar o item para você. Quer confirmar disponibilidade?'],close:['Posso deixar seu pedido separado e enviar as condições agora.','Quer finalizar com a opção mais econômica ou com a mais completa?']},
+  'Imobiliária':{first:['Olá, {nome}! Você procura imóvel para morar ou investir?','Oi, {nome}! Qual região, faixa de valor e prazo fazem sentido para você?'],follow:['Separei opções alinhadas ao que você comentou. Quer receber as melhores primeiro?','{nome}, ainda está buscando ou seu momento mudou? Posso ajustar a seleção.'],close:['Vamos agendar uma visita para comparar as melhores opções pessoalmente?','Qual horário funciona melhor para conhecer o imóvel que mais se encaixa no seu perfil?']},
+  'Serviços':{first:['Oi, {nome}! Qual problema você precisa resolver e qual é a prioridade hoje?','Olá, {nome}! Posso entender seu cenário antes de indicar a melhor solução?'],follow:['{nome}, ainda faz sentido resolver isso agora? Posso simplificar os próximos passos.','Conseguiu avaliar? Se quiser, resumo a solução em dois pontos.'],close:['Faz sentido marcarmos dez minutos para definir o início?','Posso preparar a proposta final com prazo e investimento.']}
+};
+state.businessProfile=state.businessProfile||{niche:'',customNiche:'',onboarded:false};
+function activeNiche(){return state.businessProfile.customNiche||state.businessProfile.niche||'Serviços'}
+function playbook(){return nichePlaybooks[state.businessProfile.niche]||nichePlaybooks.Serviços}
+function fillLeadName(text){return text.replaceAll('{nome}',lead()?.name||'cliente')}
+
+const nicheTemplateBase=templateText;
+templateText=function(kind,item){
+  if(state.plan!=='Base')return nicheTemplateBase(kind,item);
+  const book=playbook(),messages=kind==='Primeiro contato'?book.first:kind==='Follow-up'?book.follow:book.close;
+  return messages[0].replaceAll('{nome}',item.name);
+};
+
+const nicheDashboardBase=dashboard;
+dashboard=function(){
+  const html=nicheDashboardBase();
+  if(state.plan!=='Base')return html;
+  const book=playbook(),cards=[['Primeiro contato',book.first[0]],['Follow-up',book.follow[0]],['Fechamento',book.close[0]]];
+  return html.replace('<div class="base-shortcuts">',`<section class="niche-launch"><div class="niche-launch-head"><div><span class="eyebrow">PLAYBOOK PRONTO</span><h2>Sugestões para ${esc(activeNiche())}</h2><p>Mensagens específicas para começar, retomar e conduzir ao próximo passo.</p></div><button class="btn btn-ghost" data-modal="business-niche">Meu negócio: ${esc(activeNiche())}</button></div><div class="niche-suggestions">${cards.map(([title,message])=>`<article><span>${title}</span><p>${esc(message.replaceAll('{nome}','cliente'))}</p><button class="link" data-suggestion="${esc(message)}">Usar na conversa →</button></article>`).join('')}</div></section><div class="base-shortcuts">`);
+};
+
+const nicheModalBase=modal;
+modal=function(type,data={}){
+  if(type!=='business-niche')return nicheModalBase(type,data);
+  const options=['Barbearia','Salão de beleza','Clínica','Loja','Imobiliária','Serviços'];
+  app.insertAdjacentHTML('beforeend',`<div class="modal-backdrop" id="modal"><section class="modal"><div class="niche-onboarding-icon">✦</div><h2>Qual é o seu negócio?</h2><p>O PulseFlow vai adaptar os contatos, follow-ups e fechamentos ao seu nicho.</p><form id="business-niche-form"><div class="niche-options">${options.map(item=>`<label><input type="radio" name="niche" value="${item}" ${state.businessProfile.niche===item?'checked':''}><span>${item}</span></label>`).join('')}</div><div class="field"><label>Outro nicho</label><input name="customNiche" value="${esc(state.businessProfile.customNiche)}" placeholder="Ex.: Academia, restaurante, advocacia..."></div><div class="modal-actions"><button type="button" class="btn btn-ghost close-modal">Agora não</button><button class="btn btn-primary">Personalizar meu PulseFlow</button></div></form></section></div>`);bindModal();
+  document.querySelector('#business-niche-form')?.addEventListener('submit',event=>{event.preventDefault();const values=new FormData(event.currentTarget);state.businessProfile={niche:String(values.get('niche')||'Serviços'),customNiche:String(values.get('customNiche')||'').trim(),onboarded:true};persist();document.querySelector('#modal')?.remove();render();toast(`Sugestões adaptadas para ${activeNiche()}.`);});
+};
+
+const nicheBindBase=bind;
+bind=function(){
+  nicheBindBase();
+  document.querySelectorAll('[data-suggestion]').forEach(button=>button.onclick=()=>{const target=state.leads.find(item=>item.stage!=='closed')||state.leads[0];selectedId=target.id;state.page='conversation';persist();render();setTimeout(()=>{const input=document.querySelector('#message-input');if(input)input.value=button.dataset.suggestion.replaceAll('{nome}',target.name)},0)});
+  if(state.logged&&state.plan==='Base'&&!state.businessProfile.onboarded&&!document.querySelector('#modal'))setTimeout(()=>modal('business-niche'),250);
+};
+render();
+
 state.aiUsage=state.aiUsage||{used:184,limit:500,ownKey:false};
 if(!['Base','Equipe','Sob medida'].includes(state.plan))state.plan='Base';
 const scaleBillingBase=billing;
@@ -286,5 +331,14 @@ const completeRender=render;
 render=function(){
   if(state.logged&&state.plan==='Base'&&!['dashboard','pipeline','conversation','reminders','billing'].includes(state.page))state.page='dashboard';
   completeRender();
+};
+render();
+
+const finalLaunchDashboard=dashboard;
+dashboard=function(){
+  const html=finalLaunchDashboard();
+  if(state.plan!=='Base')return html;
+  const book=playbook(),cards=[['Primeiro contato',book.first[0]],['Follow-up',book.follow[0]],['Fechamento',book.close[0]]];
+  return html.replace('<div class="base-shortcuts">',`<section class="niche-launch"><div class="niche-launch-head"><div><span class="eyebrow">PLAYBOOK PRONTO</span><h2>Sugestões para ${esc(activeNiche())}</h2><p>Mensagens específicas para começar, retomar e conduzir ao próximo passo.</p></div><button class="btn btn-ghost" data-modal="business-niche">Meu negócio: ${esc(activeNiche())}</button></div><div class="niche-suggestions">${cards.map(([title,message])=>`<article><span>${title}</span><p>${esc(message.replaceAll('{nome}','cliente'))}</p><button class="link" data-suggestion="${esc(message)}">Usar na conversa →</button></article>`).join('')}</div></section><div class="base-shortcuts">`);
 };
 render();
