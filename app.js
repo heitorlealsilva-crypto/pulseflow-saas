@@ -252,3 +252,39 @@ const scaleBillingBase=billing;
 billing=function(){const usage=state.aiUsage;return shell(`<div class="page"><div class="page-heading"><div><h1>Plano e cobrança</h1><p>Plano atual: <b>${esc(state.plan)}</b>. A conta e o consumo da API da Meta pertencem ao cliente.</p></div></div><div class="plans plans-three"><section class="plan featured"><span class="tag">Entrada</span><h2>Base</h2><div class="price">R$ 9,90<span>/mês</span></div><ul><li>1 usuário e até 300 leads ativos</li><li>Pipeline, notas, lembretes e cadências</li><li>500 análises de IA incluídas</li><li>Envio assistido sem API</li></ul><button class="btn btn-primary btn-full choose-plan" data-plan="Base">Escolher Base</button></section><section class="plan"><h2>Equipe</h2><div class="price">R$ 29,90<span>/mês</span></div><ul><li>Até 3 usuários e 2.000 leads</li><li>Vendas, recuperação e pós-venda</li><li>2.500 análises de IA incluídas</li><li>Conta Meta do próprio cliente</li></ul><button class="btn btn-ghost btn-full choose-plan" data-plan="Equipe">Escolher Equipe</button></section><section class="plan"><h2>Sob medida</h2><div class="price">Agentes<span> adicionais</span></div><ul><li>IA observadora e operacional</li><li>VoIP, agenda e CRM</li><li>Maior franquia ou chave própria</li><li>Implantação opcional, sem mensalidade da API Meta</li></ul><button class="btn btn-ghost btn-full" data-page="settings">Configurar</button></section></div><section class="panel usage-panel"><h2>Franquia de IA</h2><p>${usage.used} de ${usage.limit} análises usadas neste ciclo.</p><div class="usage-bar"><i style="width:${Math.min(100,usage.used/usage.limit*100)}%"></i></div><p class="automation-note">O PulseFlow cobra o plano e os agentes contratados. As mensagens do WhatsApp são faturadas diretamente pela Meta na conta da empresa.</p></section></div>`,'Plano e cobrança')};
 persist();
 render();
+
+/* Plano Base: experiência guiada para quem está começando. */
+const completeNav=nav;
+nav=function(){
+  if(state.plan!=='Base')return completeNav();
+  const wa=state.integrations.whatsapp&&state.whatsapp.number;
+  const items=[['dashboard','⌂','Início'],['pipeline','▦','Leads'],['conversation','◉','Conversas'],['reminders','◷','Agenda']];
+  return `<aside class="sidebar base-sidebar"><div class="brand"><span class="brand-mark">↗</span>PulseFlow <span class="tag">Base</span></div><nav class="nav">${items.map(([id,icon,label])=>`<button data-page="${id}" class="${state.page===id?'active':''}"><span class="nav-icon">${icon}</span>${label}</button>`).join('')}</nav><div class="base-upgrade"><b>Precisa de automação?</b><span>Libere agentes, integrações e relatórios.</span><button class="btn btn-soft btn-full" data-page="billing">Ver planos</button></div><div class="sidebar-footer"><div class="whatsapp-status"><span class="status-dot ${wa?'':'offline'}"></span><b>WhatsApp ${wa?'cadastrado':'não cadastrado'}</b><button class="sidebar-whatsapp" data-modal="whatsapp-number">${wa?'Trocar número':'Cadastrar número'}</button></div><div class="sidebar-user">${esc(state.user.name)}<br><small>Minha conta</small></div></div></aside><nav class="base-mobile-nav">${items.map(([id,icon,label])=>`<button data-page="${id}" class="${state.page===id?'active':''}"><span>${icon}</span>${label}</button>`).join('')}</nav>`;
+};
+
+const completeDashboard=dashboard;
+dashboard=function(){
+  if(state.plan!=='Base')return completeDashboard();
+  const actions=state.leads.filter(item=>item.stage!=='closed'&&(!item.callDone||item.stage==='waiting')).slice(0,5);
+  return shell(`<div class="page base-home"><div class="page-heading"><div><span class="eyebrow">SEU DIA NO PULSEFLOW</span><h1>Olá, ${esc(state.user.name.split(' ')[0])}</h1><p>Você tem <b>${actions.length} ações</b> para fazer hoje.</p></div><button class="btn btn-primary" data-modal="lead">＋ Adicionar lead</button></div><div class="base-hero"><div><span>Próxima ação recomendada</span><h2>${actions[0]?(!actions[0].callDone?`Ligar para ${esc(actions[0].name)}`:`Retomar ${esc(actions[0].name)}`):'Tudo em dia'}</h2><p>${actions[0]?esc(actions[0].last):'Nenhum contato pendente agora.'}</p></div>${actions[0]?`<button class="btn btn-primary open-lead" data-lead="${actions[0].id}">Fazer agora →</button>`:''}</div><section class="panel base-today"><div class="panel-header"><div><h2>Contatos de hoje</h2><p>Faça uma ação por vez. O PulseFlow cuida da organização.</p></div><button class="link" data-page="reminders">Abrir agenda</button></div><div class="base-action-list">${actions.map(item=>`<article><span class="activity-icon">${item.callDone?'💬':'📞'}</span><div><b>${item.callDone?'Retomar conversa':'Ligar primeiro'} · ${esc(item.name)}</b><small>${esc(item.origin)} · ${stageTime(item)}</small></div><button class="btn btn-soft open-lead" data-lead="${item.id}">${item.callDone?'Abrir mensagem':'Registrar ligação'}</button></article>`).join('')||'<p class="empty">Você concluiu tudo por hoje.</p>'}</div></section><div class="base-shortcuts"><button class="btn btn-ghost" data-page="pipeline">Ver todos os leads</button><button class="btn btn-ghost" data-page="conversation">Abrir conversas</button></div></div>`,'Início');
+};
+
+const completeReminders=reminders;
+reminders=function(){
+  if(state.plan!=='Base')return completeReminders();
+  const items=state.leads.filter(item=>item.stage!=='closed'&&(!item.callDone||item.stage==='waiting'||item.nextDate));
+  return shell(`<div class="page"><div class="page-heading"><div><h1>Agenda</h1><p>Ligações, mensagens e reuniões que precisam da sua atenção.</p></div><button class="btn btn-primary" data-modal="lead">＋ Novo contato</button></div><div class="agenda-tabs"><button class="tab active">Hoje</button><button class="tab">Próximos</button><button class="tab">Concluídos</button></div><section class="panel"><div class="base-action-list">${items.map(item=>`<article><span class="activity-icon">${!item.callDone?'📞':item.nextAction==='Reunião'?'▣':'💬'}</span><div><b>${!item.callDone?'Ligação':item.nextAction||'Mensagem'} · ${esc(item.name)}</b><small>${item.nextDate?new Date(item.nextDate).toLocaleString('pt-BR'):'Ação recomendada hoje'}</small></div><button class="btn btn-primary open-lead" data-lead="${item.id}">Fazer agora</button></article>`).join('')||'<p class="empty">Nenhum agendamento pendente.</p>'}</div></section></div>`,'Agenda');
+};
+
+const completePipeline=pipeline;
+pipeline=function(){
+  if(state.plan!=='Base')return completePipeline();
+  return completePipeline().replace('Pipeline de leads','Leads').replace('Arraste os leads entre etapas. O tempo e as regras de cada coluna são monitorados automaticamente.','Acompanhe seus contatos em quatro etapas simples.').replaceAll('＋ Nova coluna','').replaceAll('⚡','');
+};
+
+const completeRender=render;
+render=function(){
+  if(state.logged&&state.plan==='Base'&&!['dashboard','pipeline','conversation','reminders','billing'].includes(state.page))state.page='dashboard';
+  completeRender();
+};
+render();
