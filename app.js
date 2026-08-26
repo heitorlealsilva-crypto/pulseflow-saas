@@ -291,7 +291,7 @@ const nicheBindBase=bind;
 bind=function(){
   nicheBindBase();
   document.querySelectorAll('[data-suggestion]').forEach(button=>button.onclick=()=>{const target=state.leads.find(item=>item.stage!=='closed')||state.leads[0];selectedId=target.id;state.page='conversation';persist();render();setTimeout(()=>{const input=document.querySelector('#message-input');if(input)input.value=button.dataset.suggestion.replaceAll('{nome}',target.name)},0)});
-  if(state.logged&&state.plan==='Base'&&!state.businessProfile.onboarded&&!nicheOnboardingScheduled&&!document.querySelector('#modal')){nicheOnboardingScheduled=true;setTimeout(()=>{if(!document.querySelector('#modal'))modal('business-niche')},250)}
+  if(state.logged&&state.plan==='Base'&&state.whatsapp.number&&!state.businessProfile.onboarded&&!nicheOnboardingScheduled&&!document.querySelector('#modal')){nicheOnboardingScheduled=true;setTimeout(()=>{if(!document.querySelector('#modal'))modal('business-niche')},250)}
 };
 render();
 
@@ -344,5 +344,26 @@ dashboard=function(){
   if(state.plan!=='Base')return html;
   const book=playbook(),cards=[['Primeiro contato',book.first[0]],['Follow-up',book.follow[0]],['Fechamento',book.close[0]]];
   return html.replace('<div class="base-shortcuts">',`<section class="niche-launch"><div class="niche-launch-head"><div><span class="eyebrow">PLAYBOOK PRONTO</span><h2>Sugestões para ${esc(activeNiche())}</h2><p>Mensagens específicas para começar, retomar e conduzir ao próximo passo.</p></div><button class="btn btn-ghost" data-modal="business-niche">Meu negócio: ${esc(activeNiche())}</button></div><div class="niche-suggestions">${cards.map(([title,message])=>`<article><span>${title}</span><p>${esc(message.replaceAll('{nome}','cliente'))}</p><button class="link" data-suggestion="${esc(message)}">Usar na conversa →</button></article>`).join('')}</div></section><div class="base-shortcuts">`);
+};
+render();
+
+const startNowDashboard=dashboard;
+dashboard=function(){
+  const html=startNowDashboard();
+  if(state.plan!=='Base'||state.whatsapp.number)return html;
+  const quickStart=`<section class="base-start-now"><span class="base-start-icon">◉</span><div><span>COMECE POR AQUI</span><h2>Cadastre seu WhatsApp</h2><p>Informe seu número e comece a organizar contatos e mensagens. A API oficial pode ser conectada depois.</p></div><button class="btn btn-primary" data-modal="whatsapp-number">Cadastrar número e começar</button></section>`;
+  return html.replace('<div class="base-hero">',quickStart+'<div class="base-hero">');
+};
+const startNowModal=modal;
+modal=function(type,data={}){
+  startNowModal(type,data);
+  if(type==='whatsapp-number'){
+    const business=document.querySelector('#whatsapp-number-form [name="businessName"]');
+    business?.removeAttribute('required');
+    const label=business?.closest('.field')?.querySelector('label');
+    if(label)label.textContent='Nome da empresa (opcional)';
+    const submit=document.querySelector('#whatsapp-number-form .btn-primary');
+    if(submit)submit.textContent='Salvar e começar';
+  }
 };
 render();
