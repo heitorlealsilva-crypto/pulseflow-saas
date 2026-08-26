@@ -96,6 +96,19 @@ class Handler(SimpleHTTPRequestHandler):
             return self.reply(load()["events"][-100:])
         if parts == ["api", "integrations"]:
             return self.reply(load()["integrations"])
+        if parts == ["api", "whatsapp"]:
+            requirements = {
+                "verifyToken": bool(os.getenv("META_VERIFY_TOKEN")),
+                "appSecret": bool(os.getenv("META_APP_SECRET")),
+                "accessToken": bool(os.getenv("META_ACCESS_TOKEN")),
+                "phoneNumberId": bool(os.getenv("META_PHONE_NUMBER_ID")),
+                "wabaId": bool(os.getenv("META_WABA_ID")),
+                "graphVersion": bool(os.getenv("META_GRAPH_VERSION")),
+            }
+            return self.reply({"ok": True, "service": "pulseflow-whatsapp-webhook", "configured": all(requirements.values()), "requirements": requirements, "eventSinkConfigured": False, "groupMode": "restricted_official_groups_api", "local": True})
+        if parts == ["api", "send-whatsapp"]:
+            requirements = {"accessToken": False, "phoneNumberId": False, "graphVersion": False, "internalKey": False}
+            return self.reply({"ok": True, "service": "pulseflow-whatsapp-send", "configured": False, "requirements": requirements, "local": True})
         return super().do_GET()
 
     def do_POST(self) -> None:
@@ -153,6 +166,14 @@ class Handler(SimpleHTTPRequestHandler):
             event(data, "call.completed", {"leadId": lead["id"], "status": payload.get("status")})
             save(data)
             return self.reply({"received": True, "callDone": lead["callDone"]})
+        if parts == ["api", "send-whatsapp"]:
+            if not payload.get("consentConfirmed"):
+                return self.fail("consentimento do contato não confirmado", HTTPStatus.CONFLICT)
+            if not payload.get("callCompleted"):
+                return self.fail("registre a ligação antes da mensagem", HTTPStatus.CONFLICT)
+            if not payload.get("to") or not payload.get("text"):
+                return self.fail("to e text são obrigatórios")
+            return self.reply({"sent": True, "provider": "local-simulation", "to": payload["to"], "rules": {"consentConfirmed": True, "callCompleted": True}})
         if len(parts) == 3 and parts[:2] == ["api", "integrations"]:
             data = load()
             provider = parts[2]

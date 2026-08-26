@@ -36,6 +36,17 @@ Para produção, mantenha esta interface e conecte os botões de integração a 
 5. Receber eventos de VoIP e Google Agenda para registrar chamadas e reuniões;
 6. Expor API REST/Webhooks para CRM externo e auditoria de todas as alterações.
 
+### WhatsApp oficial incluído
+
+O projeto inclui duas Vercel Functions:
+
+- `GET|POST /api/whatsapp`: verificação do webhook da Meta, validação HMAC da assinatura, normalização de mensagens diretas e eventos da Groups API;
+- `GET|POST /api/send-whatsapp`: envio pela Cloud API, protegido por chave interna e bloqueado sem consentimento ou ligação registrada.
+
+Configure na Vercel: `META_VERIFY_TOKEN`, `META_APP_SECRET`, `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_WABA_ID`, `META_GRAPH_VERSION` e `PULSEFLOW_INTERNAL_API_KEY`. Para persistir os eventos recebidos, configure também `PULSEFLOW_EVENT_SINK_URL` e, opcionalmente, `PULSEFLOW_EVENT_SINK_KEY`.
+
+Credenciais nunca são armazenadas no navegador. A Groups API é uma capacidade oficial restrita: exige elegibilidade e aprovação da Meta, usa grupos compatíveis criados/administrados pela API e não deve ser tratada como acesso geral a qualquer grupo existente do aplicativo.
+
 ## API local incluída
 
 Com Python 3 instalado, execute `python server.py` e acesse `http://127.0.0.1:8787`.
