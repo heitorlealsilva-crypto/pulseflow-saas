@@ -46,4 +46,6 @@
 .admin-table-wrap .table{min-width:720px}
 .admin-search{max-width:300px}
 .platform-admin .role{display:inline-flex;padding:5px 9px;border-radius:999px;background:#eef2ff;color:#4338ca;font-size:12px;font-weight:700}
+.sidebar-logout{margin:10px 16px 16px;padding:10px;border:1px solid #d9e1ee;border-radius:10px;background:#fff;color:#475569;cursor:pointer;font:inherit;font-weight:700}
+.sidebar-logout:hover{background:#f8fafc;color:#0f172a}
 @media(max-width:700px){.platform-admin .page-heading{align-items:flex-start}.platform-admin .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.platform-admin .metric{padding:14px 10px}.platform-admin .metric-value{font-size:24px}.admin-search{max-width:160px}}
