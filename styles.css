@@ -51,4 +51,6 @@
 .admin-account-actions{display:flex;align-items:center;gap:10px;white-space:nowrap}
 .support-banner{display:flex;align-items:center;gap:12px;padding:10px 20px;background:#fff7ed;border-bottom:1px solid #fed7aa;color:#9a3412;position:sticky;top:0;z-index:20}
 .support-banner span{flex:1}.support-banner button{border:0;background:#9a3412;color:#fff;border-radius:8px;padding:8px 12px;font-weight:700;cursor:pointer}
+.manual-mode-note{display:flex;gap:10px;align-items:center;padding:14px 16px;margin-bottom:16px;border:1px solid #bbf7d0;background:#f0fdf4;border-radius:12px;color:#166534}.manual-mode-note span{color:#3f6212}
+.manual-sequence>p{font-size:13px;color:#64748b}.manual-step-list{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px}.manual-step-list button{display:flex;flex-direction:column;align-items:center;gap:2px;border:1px solid #dbe4f0;background:#fff;border-radius:9px;padding:8px 4px;color:#334155;cursor:pointer}.manual-step-list button:hover{border-color:#16a34a;background:#f0fdf4}.manual-step-list b{color:#16a34a}.manual-step-list span{font-size:10px}
 @media(max-width:700px){.platform-admin .page-heading{align-items:flex-start}.platform-admin .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.platform-admin .metric{padding:14px 10px}.platform-admin .metric-value{font-size:24px}.admin-search{max-width:160px}}
