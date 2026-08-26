@@ -38,3 +38,12 @@
 @media(max-width:760px){.niche-launch-head{display:block}.niche-launch-head .btn{width:100%;margin-top:12px}.niche-suggestions{grid-template-columns:1fr}.niche-options{grid-template-columns:1fr 1fr}}
 .base-start-now{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:15px;margin:0 0 17px;padding:18px;border:1px solid #86efac;border-radius:14px;background:linear-gradient(105deg,#f0fdf4,#fff)}.base-start-icon{display:grid;place-items:center;width:46px;height:46px;border-radius:13px;background:#dcfce7;color:#15803d;font-size:22px;font-weight:850}.base-start-now>div>span{color:#15803d;font-size:9px;font-weight:850;letter-spacing:.7px}.base-start-now h2{margin:3px 0;font-size:18px}.base-start-now p{margin:0;color:#64748b;font-size:11px;line-height:1.45}
 @media(max-width:760px){.base-start-now{grid-template-columns:auto 1fr;padding:15px}.base-start-now .btn{grid-column:1/-1;width:100%}}
+/* Autenticação e administração global */
+.auth-error{min-height:22px;color:#c2410c;font-size:14px;margin:4px 0}
+.login-switch{text-align:center;margin:18px 0 8px;color:#64748b}
+.platform-admin .panel{overflow:hidden}
+.admin-table-wrap{width:100%;overflow-x:auto}
+.admin-table-wrap .table{min-width:720px}
+.admin-search{max-width:300px}
+.platform-admin .role{display:inline-flex;padding:5px 9px;border-radius:999px;background:#eef2ff;color:#4338ca;font-size:12px;font-weight:700}
+@media(max-width:700px){.platform-admin .page-heading{align-items:flex-start}.platform-admin .metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.platform-admin .metric{padding:14px 10px}.platform-admin .metric-value{font-size:24px}.admin-search{max-width:160px}}
