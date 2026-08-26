@@ -280,6 +280,9 @@ modal=function(type,data={}){
   if(type!=='business-niche')return nicheModalBase(type,data);
   const options=['Barbearia','Salão de beleza','Clínica','Loja','Imobiliária','Serviços'];
   app.insertAdjacentHTML('beforeend',`<div class="modal-backdrop" id="modal"><section class="modal"><div class="niche-onboarding-icon">✦</div><h2>Qual é o seu negócio?</h2><p>O PulseFlow vai adaptar os contatos, follow-ups e fechamentos ao seu nicho.</p><form id="business-niche-form"><div class="niche-options">${options.map(item=>`<label><input type="radio" name="niche" value="${item}" ${state.businessProfile.niche===item?'checked':''}><span>${item}</span></label>`).join('')}</div><div class="field"><label>Outro nicho</label><input name="customNiche" value="${esc(state.businessProfile.customNiche)}" placeholder="Ex.: Academia, restaurante, advocacia..."></div><div class="modal-actions"><button type="button" class="btn btn-ghost close-modal">Agora não</button><button class="btn btn-primary">Personalizar meu PulseFlow</button></div></form></section></div>`);bindModal();
+  const nicheForm=document.querySelector('#business-niche-form'),customInput=nicheForm?.elements.customNiche;
+  nicheForm?.querySelectorAll('input[name="niche"]').forEach(input=>input.addEventListener('change',()=>{if(input.checked)customInput.value=''}));
+  customInput?.addEventListener('input',()=>{if(customInput.value.trim())nicheForm.querySelectorAll('input[name="niche"]').forEach(input=>input.checked=false)});
   document.querySelector('#business-niche-form')?.addEventListener('submit',event=>{event.preventDefault();const values=new FormData(event.currentTarget);state.businessProfile={niche:String(values.get('niche')||'Serviços'),customNiche:String(values.get('customNiche')||'').trim(),onboarded:true};persist();document.querySelector('#modal')?.remove();render();toast(`Sugestões adaptadas para ${activeNiche()}.`);});
 };
 
