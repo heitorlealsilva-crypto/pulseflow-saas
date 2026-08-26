@@ -66,7 +66,19 @@ def ensure_schema(db) -> None:
             expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """, "CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)",
-        "CREATE INDEX IF NOT EXISTS users_org_idx ON users(organization_id)"]
+        "CREATE INDEX IF NOT EXISTS users_org_idx ON users(organization_id)", """
+        CREATE TABLE IF NOT EXISTS tenant_workspaces (
+            organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+            state JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """, """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id BIGSERIAL PRIMARY KEY, actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+            organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+            action TEXT NOT NULL, metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """, "CREATE INDEX IF NOT EXISTS audit_org_idx ON audit_logs(organization_id, created_at DESC)"]
     for statement in statements:
         db.execute(statement)
     admin_email = os.getenv("PULSEFLOW_ADMIN_EMAIL", "").strip().lower()
@@ -116,9 +128,24 @@ class handler(BaseHTTPRequestHandler):
             return None
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         return db.execute(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=%s AND s.expires_at>NOW() AND u.status='active'",
+            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN organizations o ON o.id=u.organization_id WHERE s.token_hash=%s AND s.expires_at>NOW() AND u.status='active' AND (u.role='super_admin' OR o.status='active')",
             (token_hash,),
         ).fetchone()
+
+    def requested_organization(self) -> str:
+        return parse_qs(urlparse(self.path).query).get("organization_id", [""])[0]
+
+    def allowed_organization(self, user: dict, requested: str) -> str | None:
+        own = str(user.get("organization_id") or "")
+        if user["role"] == "super_admin":
+            return requested or None
+        return own if not requested or requested == own else None
+
+    def audit(self, db, user: dict, organization_id: str, action: str, metadata: dict | None = None) -> None:
+        db.execute(
+            "INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
+            (user["id"], organization_id, action, json.dumps(metadata or {})),
+        )
 
     def do_GET(self) -> None:
         try:
@@ -136,7 +163,20 @@ class handler(BaseHTTPRequestHandler):
                         return self.reply(403, {"ok": False, "error": "acesso restrito"})
                     accounts = db.execute("SELECT o.*,COUNT(u.id)::int AS users_count FROM organizations o LEFT JOIN users u ON u.organization_id=o.id GROUP BY o.id ORDER BY o.created_at DESC").fetchall()
                     users = db.execute("SELECT u.id,u.name,u.email,u.role,u.status,u.last_login_at,u.created_at,u.organization_id,o.name AS organization_name FROM users u LEFT JOIN organizations o ON o.id=u.organization_id ORDER BY u.created_at DESC").fetchall()
-                    return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "summary": {"accounts": len(accounts), "users": len(users), "active": sum(1 for item in users if item["status"] == "active")}})
+                    audits = db.execute("SELECT a.action,a.created_at,o.name AS organization_name,u.name AS actor_name FROM audit_logs a LEFT JOIN organizations o ON o.id=a.organization_id LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 30").fetchall()
+                    return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "audits": audits, "summary": {"accounts": len(accounts), "users": len(users), "active": sum(1 for item in users if item["status"] == "active")}})
+                if self.action() == "workspace":
+                    organization_id = self.allowed_organization(user, self.requested_organization())
+                    if not organization_id:
+                        return self.reply(403, {"ok": False, "error": "conta não autorizada"})
+                    account = db.execute("SELECT id,name,plan,status FROM organizations WHERE id=%s", (organization_id,)).fetchone()
+                    if not account:
+                        return self.reply(404, {"ok": False, "error": "conta não encontrada"})
+                    row = db.execute("SELECT state,updated_at FROM tenant_workspaces WHERE organization_id=%s", (organization_id,)).fetchone()
+                    if user["role"] == "super_admin":
+                        self.audit(db, user, organization_id, "support.workspace.opened")
+                        db.commit()
+                    return self.reply(200, {"ok": True, "account": account, "workspace": row["state"] if row else None, "updated_at": row["updated_at"] if row else None})
                 return self.reply(404, {"ok": False, "error": "ação não encontrada"})
         except Exception:
             return self.reply(503, {"ok": False, "error": "serviço indisponível"})
@@ -163,12 +203,42 @@ class handler(BaseHTTPRequestHandler):
                     return self._create_session(db, user_id)
                 if action == "login":
                     email = str(payload.get("email", "")).strip().lower()
-                    user = db.execute("SELECT * FROM users WHERE email=%s AND status='active'", (email,)).fetchone()
+                    user = db.execute("SELECT u.* FROM users u LEFT JOIN organizations o ON o.id=u.organization_id WHERE u.email=%s AND u.status='active' AND (u.role='super_admin' OR o.status='active')", (email,)).fetchone()
                     if not user or not password_valid(str(payload.get("password", "")), user["password_hash"]):
                         return self.reply(401, {"ok": False, "error": "e-mail ou senha inválidos"})
                     db.execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user["id"],))
                     db.commit()
                     return self._create_session(db, user["id"])
+                if action == "workspace":
+                    user = self.current_user(db)
+                    if not user:
+                        return self.reply(401, {"ok": False, "error": "não autenticado"})
+                    organization_id = self.allowed_organization(user, str(payload.get("organization_id", "")))
+                    workspace = payload.get("state")
+                    if not organization_id or not isinstance(workspace, dict):
+                        return self.reply(403, {"ok": False, "error": "conta não autorizada"})
+                    encoded = json.dumps(workspace, ensure_ascii=False)
+                    if len(encoded.encode()) > 2_000_000:
+                        return self.reply(413, {"ok": False, "error": "dados da conta excedem o limite"})
+                    db.execute("INSERT INTO tenant_workspaces(organization_id,state,updated_at) VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(organization_id) DO UPDATE SET state=EXCLUDED.state,updated_at=NOW()", (organization_id, encoded))
+                    if user["role"] == "super_admin":
+                        self.audit(db, user, organization_id, "support.workspace.updated")
+                    db.commit()
+                    return self.reply(200, {"ok": True})
+                if action == "admin-account":
+                    user = self.current_user(db)
+                    if not user or user["role"] != "super_admin":
+                        return self.reply(403, {"ok": False, "error": "acesso restrito"})
+                    organization_id = str(payload.get("organization_id", ""))
+                    status = str(payload.get("status", ""))
+                    if status not in ("active", "suspended"):
+                        return self.reply(400, {"ok": False, "error": "status inválido"})
+                    updated = db.execute("UPDATE organizations SET status=%s WHERE id=%s RETURNING id", (status, organization_id)).fetchone()
+                    if not updated:
+                        return self.reply(404, {"ok": False, "error": "conta não encontrada"})
+                    self.audit(db, user, organization_id, f"admin.account.{status}")
+                    db.commit()
+                    return self.reply(200, {"ok": True, "status": status})
                 if action == "logout":
                     token = self.session_token()
                     if token:
