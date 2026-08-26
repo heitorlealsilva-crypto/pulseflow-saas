@@ -283,11 +283,12 @@ modal=function(type,data={}){
   document.querySelector('#business-niche-form')?.addEventListener('submit',event=>{event.preventDefault();const values=new FormData(event.currentTarget);state.businessProfile={niche:String(values.get('niche')||'Serviços'),customNiche:String(values.get('customNiche')||'').trim(),onboarded:true};persist();document.querySelector('#modal')?.remove();render();toast(`Sugestões adaptadas para ${activeNiche()}.`);});
 };
 
+let nicheOnboardingScheduled=false;
 const nicheBindBase=bind;
 bind=function(){
   nicheBindBase();
   document.querySelectorAll('[data-suggestion]').forEach(button=>button.onclick=()=>{const target=state.leads.find(item=>item.stage!=='closed')||state.leads[0];selectedId=target.id;state.page='conversation';persist();render();setTimeout(()=>{const input=document.querySelector('#message-input');if(input)input.value=button.dataset.suggestion.replaceAll('{nome}',target.name)},0)});
-  if(state.logged&&state.plan==='Base'&&!state.businessProfile.onboarded&&!document.querySelector('#modal'))setTimeout(()=>modal('business-niche'),250);
+  if(state.logged&&state.plan==='Base'&&!state.businessProfile.onboarded&&!nicheOnboardingScheduled&&!document.querySelector('#modal')){nicheOnboardingScheduled=true;setTimeout(()=>{if(!document.querySelector('#modal'))modal('business-niche')},250)}
 };
 render();
 
