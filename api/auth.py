@@ -1,10 +1,12 @@
-"""Autenticação multiempresa e administração global do MVP PulseFlow."""
+"""Autenticação, isolamento por empresa e administração do PulseFlow."""
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,245 +17,496 @@ from urllib.parse import parse_qs, urlparse
 import psycopg
 from psycopg.rows import dict_row
 
+MAX_BODY_BYTES = 2_000_000
+PERMISSIONS = ("workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage")
+WORKSPACE_TYPES = {
+    "leads": list, "columns": list, "postSaleColumns": list, "cadence": list,
+    "reminders": list, "notifications": list, "manualApprovals": list,
+    "postSaleCustomers": list, "whatsappImported": list,
+    "whatsapp": dict, "businessProfile": dict, "ai": dict, "settings": dict,
+    "integrations": dict, "templates": dict, "pipelineBoard": str,
+    "schemaVersion": int, "manualCadenceVersion": int,
+}
+SETTINGS_FIELDS = {"columns", "postSaleColumns", "cadence", "whatsapp", "businessProfile", "ai", "settings", "integrations", "templates"}
+SECRET_FIELDS = {"password", "passwordhash", "token", "accesstoken", "refreshtoken", "appsecret", "verifytoken", "apikey", "secret", "authorization", "cookie", "session", "credentials", "accesstokenenc", "appsecretenc"}
+_SCHEMA_READY_FOR = None
 
-def utcnow() -> datetime:
+
+class RequestError(ValueError):
+    def __init__(self, message, status=400, **details):
+        super().__init__(message)
+        self.status, self.details = status, details
+
+
+def utcnow():
     return datetime.now(timezone.utc)
 
 
-def database_url() -> str:
-    return os.getenv("STORAGE_URL") or os.getenv("DATABASE_URL") or ""
+def database_url():
+    return os.getenv("DATABASE_URL") or os.getenv("STORAGE_URL") or ""
 
 
-def password_hash(password: str, salt: bytes | None = None) -> str:
+def password_hash(password, salt=None):
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 210_000)
     return f"pbkdf2_sha256$210000${salt.hex()}${digest.hex()}"
 
 
-def password_valid(password: str, encoded: str) -> bool:
+def password_valid(password, encoded):
     try:
-        _, rounds, salt_hex, expected = encoded.split("$", 3)
+        algorithm, rounds, salt_hex, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256" or not 100_000 <= int(rounds) <= 1_000_000:
+            return False
         digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds)).hex()
         return hmac.compare_digest(digest, expected)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return False
 
 
 def connect():
-    url = database_url()
-    if not url:
+    if not database_url():
         raise RuntimeError("banco não configurado")
-    return psycopg.connect(url, row_factory=dict_row)
+    return psycopg.connect(database_url(), row_factory=dict_row, connect_timeout=10)
 
 
-def ensure_schema(db) -> None:
+def ensure_schema(db):
+    global _SCHEMA_READY_FOR
+    if database_url() and _SCHEMA_READY_FOR == database_url():
+        return
+    db.execute("SELECT pg_advisory_xact_lock(817405201)")
     statements = ["""
         CREATE TABLE IF NOT EXISTS organizations (
             id UUID PRIMARY KEY, name TEXT NOT NULL, plan TEXT NOT NULL DEFAULT 'Base',
             niche TEXT NOT NULL DEFAULT '', whatsapp TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """, """
+            status TEXT NOT NULL DEFAULT 'active', permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb", """
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY, organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
             name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'owner', status TEXT NOT NULL DEFAULT 'active',
-            last_login_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
+            last_login_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
     """, """
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
+            expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
     """, "CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)",
         "CREATE INDEX IF NOT EXISTS users_org_idx ON users(organization_id)", """
         CREATE TABLE IF NOT EXISTS tenant_workspaces (
             organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
-            state JSONB NOT NULL DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """, """
+            state JSONB NOT NULL DEFAULT '{}'::jsonb, revision BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "ALTER TABLE tenant_workspaces ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0", """
         CREATE TABLE IF NOT EXISTS audit_logs (
             id BIGSERIAL PRIMARY KEY, actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
             organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
             action TEXT NOT NULL, metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """, "CREATE INDEX IF NOT EXISTS audit_org_idx ON audit_logs(organization_id, created_at DESC)"]
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "CREATE INDEX IF NOT EXISTS audit_org_idx ON audit_logs(organization_id, created_at DESC)", """
+        CREATE TABLE IF NOT EXISTS auth_rate_limits (
+            bucket_hash TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 1,
+            resets_at TIMESTAMPTZ NOT NULL)
+    """, "CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry_idx ON auth_rate_limits(resets_at)"]
     for statement in statements:
         db.execute(statement)
     admin_email = os.getenv("PULSEFLOW_ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("PULSEFLOW_ADMIN_PASSWORD", "")
-    if admin_email and admin_password:
+    if admin_email and len(admin_password) >= 12:
         exists = db.execute("SELECT 1 FROM users WHERE email=%s", (admin_email,)).fetchone()
         if not exists:
-            db.execute(
-                "INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,NULL,%s,%s,%s,'super_admin')",
-                (uuid.uuid4(), "Administrador PulseFlow", admin_email, password_hash(admin_password)),
-            )
+            # Never promote an existing customer through an environment variable.
+            db.execute("""INSERT INTO users(id,organization_id,name,email,password_hash,role)
+                          VALUES(%s,NULL,%s,%s,%s,'super_admin') ON CONFLICT(email) DO NOTHING""",
+                       (uuid.uuid4(), "Administrador PulseFlow", admin_email, password_hash(admin_password)))
     db.commit()
+    _SCHEMA_READY_FOR = database_url() or None
 
 
-def public_user(row: dict) -> dict:
+def public_user(row):
     return {key: row.get(key) for key in ("id", "name", "email", "role", "status", "organization_id")}
 
 
+def public_account(row):
+    if not row:
+        return None
+    account = {key: row.get(key) for key in ("id", "name", "plan", "status")}
+    configured = row.get("permissions") or {}
+    account["permissions"] = {key: configured.get(key, True) is True for key in PERMISSIONS}
+    return account
+
+
+def require_permission(user, account, permission):
+    if user["role"] == "super_admin":
+        return
+    if account["status"] != "active" or not account["permissions"][permission]:
+        raise RequestError("acesso não autorizado para esta conta", 403)
+
+
+def organization_uuid(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        raise RequestError("identificador de conta inválido")
+
+
+def _clean_value(value, depth=0):
+    if depth > 16:
+        raise RequestError("dados excedem a profundidade permitida")
+    if isinstance(value, dict):
+        if len(value) > 1000:
+            raise RequestError("objeto excede o limite de campos")
+        return {key: _clean_value(child, depth + 1) for key, child in value.items()
+                if len(key) <= 100 and re.sub(r"[^a-z]", "", key.lower()) not in SECRET_FIELDS}
+    if isinstance(value, list):
+        if len(value) > 20000:
+            raise RequestError("lista excede o limite de itens")
+        return [_clean_value(child, depth + 1) for child in value]
+    if isinstance(value, str) and len(value) > 100000:
+        raise RequestError("texto excede o limite de tamanho")
+    return value
+
+
+def clean_workspace(workspace):
+    if not isinstance(workspace, dict):
+        raise RequestError("dados da conta inválidos")
+    result = {}
+    for key, value in workspace.items():
+        expected = WORKSPACE_TYPES.get(key)
+        if expected is None:
+            continue
+        if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+            raise RequestError(f"formato inválido no campo {key}")
+        result[key] = _clean_value(value)
+    return result
+
+
+def normalized_origin(value):
+    parsed = urlparse(value or "")
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        return None
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return None
+    try:
+        return parsed.scheme, parsed.hostname.lower(), parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+
+
 class handler(BaseHTTPRequestHandler):
-    def reply(self, status: int, value: dict, cookie: str | None = None) -> None:
+    def log_message(self, *args):
+        # Never include cookies or query strings in application logs.
+        return
+
+    def reply(self, status, value, cookie=None):
         raw = json.dumps(value, ensure_ascii=False, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
 
-    def body(self) -> dict:
+    def body(self):
         try:
-            return json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
-        except json.JSONDecodeError:
-            return {}
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise RequestError("tamanho de requisição inválido")
+        if length < 0:
+            raise RequestError("tamanho de requisição inválido")
+        if length > MAX_BODY_BYTES:
+            raise RequestError("dados da conta excedem o limite", 413)
+        if self.headers.get("Transfer-Encoding"):
+            raise RequestError("formato de requisição não suportado")
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise RequestError("envie dados no formato JSON", 415)
+        try:
+            def reject_constant(_):
+                raise ValueError("JSON inválido")
+            result = json.loads(self.rfile.read(length) or b"{}", parse_constant=reject_constant)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise RequestError("JSON inválido")
+        if not isinstance(result, dict):
+            raise RequestError("JSON deve ser um objeto")
+        return result
 
-    def action(self) -> str:
+    def check_origin(self):
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            raise RequestError("origem da requisição não autorizada", 403)
+        origin = normalized_origin(self.headers.get("Origin") or self.headers.get("Referer"))
+        host = self.headers.get("Host", "")
+        expected = normalized_origin("https://" + host)
+        local = normalized_origin("http://" + host)
+        configured = normalized_origin(os.getenv("PULSEFLOW_APP_URL", ""))
+        if not origin or origin not in {expected, local, configured}:
+            raise RequestError("origem da requisição não autorizada", 403)
+
+    def action(self):
         return parse_qs(urlparse(self.path).query).get("action", [""])[0]
 
-    def session_token(self) -> str:
-        jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        return jar.get("pulseflow_session").value if jar.get("pulseflow_session") else ""
+    def session_token(self):
+        try:
+            jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
+            return jar.get("pulseflow_session").value if jar.get("pulseflow_session") else ""
+        except cookies.CookieError:
+            return ""
 
-    def current_user(self, db) -> dict | None:
+    def current_user(self, db):
         token = self.session_token()
-        if not token:
+        if not token or len(token) > 256:
             return None
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        return db.execute(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN organizations o ON o.id=u.organization_id WHERE s.token_hash=%s AND s.expires_at>NOW() AND u.status='active' AND (u.role='super_admin' OR o.status='active')",
-            (token_hash,),
-        ).fetchone()
+        return db.execute("""
+            SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+            LEFT JOIN organizations o ON o.id=u.organization_id
+            WHERE s.token_hash=%s AND s.expires_at>NOW() AND u.status='active'
+            AND (u.role='super_admin' OR o.status='active')
+        """, (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
 
-    def requested_organization(self) -> str:
+    def requested_organization(self):
         return parse_qs(urlparse(self.path).query).get("organization_id", [""])[0]
 
-    def allowed_organization(self, user: dict, requested: str) -> str | None:
+    def allowed_organization(self, user, requested):
         own = str(user.get("organization_id") or "")
         if user["role"] == "super_admin":
-            return requested or None
-        return own if not requested or requested == own else None
+            return organization_uuid(requested) if requested else None
+        return own if own and (not requested or requested == own) else None
 
-    def audit(self, db, user: dict, organization_id: str, action: str, metadata: dict | None = None) -> None:
-        db.execute(
-            "INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
-            (user["id"], organization_id, action, json.dumps(metadata or {})),
-        )
+    def account(self, db, organization_id, locked=False):
+        row = db.execute("SELECT id,name,plan,status,permissions FROM organizations WHERE id=%s" + (" FOR UPDATE" if locked else ""), (organization_id,)).fetchone()
+        if not row:
+            raise RequestError("conta não encontrada", 404)
+        return public_account(row)
 
-    def do_GET(self) -> None:
+    def audit(self, db, user, organization_id, action, metadata=None):
+        db.execute("INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata) VALUES(%s,%s,%s,%s::jsonb)",
+                   (user["id"], organization_id, action, json.dumps(metadata or {})))
+
+    def client_ip(self):
+        address = self.client_address[0]
+        if os.getenv("VERCEL"):
+            address = self.headers.get("X-Vercel-Forwarded-For", address).split(",", 1)[0].strip()
         try:
-            with connect() as db:
-                ensure_schema(db)
-                user = self.current_user(db)
-                if self.action() == "health":
-                    return self.reply(200, {"ok": True, "database": True, "adminConfigured": bool(os.getenv("PULSEFLOW_ADMIN_EMAIL") and os.getenv("PULSEFLOW_ADMIN_PASSWORD"))})
-                if not user:
-                    return self.reply(401, {"ok": False, "error": "não autenticado"})
-                if self.action() == "me":
-                    return self.reply(200, {"ok": True, "user": public_user(user)})
-                if self.action() == "admin":
-                    if user["role"] != "super_admin":
-                        return self.reply(403, {"ok": False, "error": "acesso restrito"})
-                    accounts = db.execute("SELECT o.*,COUNT(u.id)::int AS users_count FROM organizations o LEFT JOIN users u ON u.organization_id=o.id GROUP BY o.id ORDER BY o.created_at DESC").fetchall()
-                    users = db.execute("SELECT u.id,u.name,u.email,u.role,u.status,u.last_login_at,u.created_at,u.organization_id,o.name AS organization_name FROM users u LEFT JOIN organizations o ON o.id=u.organization_id ORDER BY u.created_at DESC").fetchall()
-                    audits = db.execute("SELECT a.action,a.created_at,o.name AS organization_name,u.name AS actor_name FROM audit_logs a LEFT JOIN organizations o ON o.id=a.organization_id LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 30").fetchall()
-                    return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "audits": audits, "summary": {"accounts": len(accounts), "users": len(users), "active": sum(1 for item in users if item["status"] == "active")}})
-                if self.action() == "workspace":
-                    organization_id = self.allowed_organization(user, self.requested_organization())
-                    if not organization_id:
-                        return self.reply(403, {"ok": False, "error": "conta não autorizada"})
-                    account = db.execute("SELECT id,name,plan,status FROM organizations WHERE id=%s", (organization_id,)).fetchone()
-                    if not account:
-                        return self.reply(404, {"ok": False, "error": "conta não encontrada"})
-                    row = db.execute("SELECT state,updated_at FROM tenant_workspaces WHERE organization_id=%s", (organization_id,)).fetchone()
-                    if user["role"] == "super_admin":
-                        self.audit(db, user, organization_id, "support.workspace.opened")
-                        db.commit()
-                    return self.reply(200, {"ok": True, "account": account, "workspace": row["state"] if row else None, "updated_at": row["updated_at"] if row else None})
-                return self.reply(404, {"ok": False, "error": "ação não encontrada"})
-        except Exception:
-            return self.reply(503, {"ok": False, "error": "serviço indisponível"})
+            return str(ipaddress.ip_address(address))
+        except ValueError:
+            return "unknown"
 
-    def do_POST(self) -> None:
-        payload = self.body()
+    def rate_limit(self, db, action, email=""):
+        buckets = [(f"{action}:ip:{self.client_ip()}", 60 if action == "login" else 10)]
+        if action == "login":
+            buckets.append((f"login:email:{email}", 8))
+        denied = False
+        seconds = 900 if action == "login" else 3600
+        for raw_key, maximum in buckets:
+            row = db.execute("""
+                INSERT INTO auth_rate_limits(bucket_hash,attempts,resets_at)
+                VALUES(%s,1,NOW() + (%s * INTERVAL '1 second'))
+                ON CONFLICT(bucket_hash) DO UPDATE SET
+                    attempts=CASE WHEN auth_rate_limits.resets_at<=NOW() THEN 1 ELSE auth_rate_limits.attempts+1 END,
+                    resets_at=CASE WHEN auth_rate_limits.resets_at<=NOW() THEN EXCLUDED.resets_at ELSE auth_rate_limits.resets_at END
+                RETURNING attempts
+            """, (hashlib.sha256(raw_key.encode()).hexdigest(), seconds)).fetchone()
+            denied = denied or row["attempts"] > maximum
+        db.execute("DELETE FROM auth_rate_limits WHERE resets_at < NOW() - INTERVAL '1 day'")
+        db.commit()
+        if denied:
+            raise RequestError("muitas tentativas; aguarde antes de tentar novamente", 429)
+
+    def do_GET(self):
         try:
             with connect() as db:
                 ensure_schema(db)
                 action = self.action()
-                if action == "register":
-                    required = ("name", "email", "password", "company")
-                    if any(not str(payload.get(item, "")).strip() for item in required):
-                        return self.reply(400, {"ok": False, "error": "preencha nome, empresa, e-mail e senha"})
-                    email = str(payload["email"]).strip().lower()
-                    if len(str(payload["password"])) < 8:
-                        return self.reply(400, {"ok": False, "error": "a senha precisa ter pelo menos 8 caracteres"})
-                    if db.execute("SELECT 1 FROM users WHERE email=%s", (email,)).fetchone():
-                        return self.reply(409, {"ok": False, "error": "e-mail já cadastrado"})
-                    org_id, user_id = uuid.uuid4(), uuid.uuid4()
-                    db.execute("INSERT INTO organizations(id,name,niche,whatsapp) VALUES(%s,%s,%s,%s)", (org_id, str(payload["company"]).strip(), str(payload.get("niche", "")).strip(), str(payload.get("whatsapp", "")).strip()))
-                    db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'owner')", (user_id, org_id, str(payload["name"]).strip(), email, password_hash(str(payload["password"]))))
-                    db.commit()
-                    return self._create_session(db, user_id)
-                if action == "login":
-                    email = str(payload.get("email", "")).strip().lower()
-                    user = db.execute("SELECT u.* FROM users u LEFT JOIN organizations o ON o.id=u.organization_id WHERE u.email=%s AND u.status='active' AND (u.role='super_admin' OR o.status='active')", (email,)).fetchone()
-                    if not user or not password_valid(str(payload.get("password", "")), user["password_hash"]):
-                        return self.reply(401, {"ok": False, "error": "e-mail ou senha inválidos"})
-                    db.execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user["id"],))
-                    db.commit()
-                    return self._create_session(db, user["id"])
+                if action == "health":
+                    admin = db.execute("SELECT 1 FROM users WHERE role='super_admin' AND status='active' LIMIT 1").fetchone()
+                    return self.reply(200, {"ok": True, "database": True, "adminConfigured": bool(admin)})
+                user = self.current_user(db)
+                if not user:
+                    raise RequestError("não autenticado", 401)
+                if action == "me":
+                    account = self.account(db, user["organization_id"]) if user["organization_id"] else None
+                    return self.reply(200, {"ok": True, "user": public_user(user), "account": account})
+                if action == "admin":
+                    if user["role"] != "super_admin":
+                        raise RequestError("acesso restrito", 403)
+                    accounts = db.execute("SELECT o.*,COUNT(u.id)::int AS users_count FROM organizations o LEFT JOIN users u ON u.organization_id=o.id GROUP BY o.id ORDER BY o.created_at DESC").fetchall()
+                    for row in accounts:
+                        row["permissions"] = public_account(row)["permissions"]
+                    users = db.execute("SELECT u.id,u.name,u.email,u.role,u.status,u.last_login_at,u.created_at,u.organization_id,o.name AS organization_name FROM users u LEFT JOIN organizations o ON o.id=u.organization_id ORDER BY u.created_at DESC").fetchall()
+                    audits = db.execute("SELECT a.id,a.action,a.metadata,a.created_at,a.organization_id,o.name AS organization_name,u.name AS actor_name FROM audit_logs a LEFT JOIN organizations o ON o.id=a.organization_id LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100").fetchall()
+                    return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "audits": audits,
+                                           "summary": {"accounts": len(accounts), "users": len(users), "active": sum(item["status"] == "active" for item in users)}})
                 if action == "workspace":
-                    user = self.current_user(db)
-                    if not user:
-                        return self.reply(401, {"ok": False, "error": "não autenticado"})
-                    organization_id = self.allowed_organization(user, str(payload.get("organization_id", "")))
-                    workspace = payload.get("state")
-                    if not organization_id or not isinstance(workspace, dict):
-                        return self.reply(403, {"ok": False, "error": "conta não autorizada"})
-                    encoded = json.dumps(workspace, ensure_ascii=False)
-                    if len(encoded.encode()) > 2_000_000:
-                        return self.reply(413, {"ok": False, "error": "dados da conta excedem o limite"})
-                    db.execute("INSERT INTO tenant_workspaces(organization_id,state,updated_at) VALUES(%s,%s::jsonb,NOW()) ON CONFLICT(organization_id) DO UPDATE SET state=EXCLUDED.state,updated_at=NOW()", (organization_id, encoded))
+                    organization_id = self.allowed_organization(user, self.requested_organization())
+                    if not organization_id:
+                        raise RequestError("conta não autorizada", 403)
+                    account = self.account(db, organization_id)
+                    require_permission(user, account, "workspace_read")
+                    row = db.execute("SELECT state,revision,updated_at FROM tenant_workspaces WHERE organization_id=%s", (organization_id,)).fetchone()
                     if user["role"] == "super_admin":
-                        self.audit(db, user, organization_id, "support.workspace.updated")
-                    db.commit()
-                    return self.reply(200, {"ok": True})
-                if action == "admin-account":
-                    user = self.current_user(db)
-                    if not user or user["role"] != "super_admin":
-                        return self.reply(403, {"ok": False, "error": "acesso restrito"})
-                    organization_id = str(payload.get("organization_id", ""))
-                    status = str(payload.get("status", ""))
-                    if status not in ("active", "suspended"):
-                        return self.reply(400, {"ok": False, "error": "status inválido"})
-                    updated = db.execute("UPDATE organizations SET status=%s WHERE id=%s RETURNING id", (status, organization_id)).fetchone()
-                    if not updated:
-                        return self.reply(404, {"ok": False, "error": "conta não encontrada"})
-                    self.audit(db, user, organization_id, f"admin.account.{status}")
-                    db.commit()
-                    return self.reply(200, {"ok": True, "status": status})
+                        self.audit(db, user, organization_id, "support.workspace.opened")
+                        db.commit()
+                    return self.reply(200, {"ok": True, "account": account, "workspace": clean_workspace(row["state"]) if row else None,
+                                           "revision": row["revision"] if row else 0, "updated_at": row["updated_at"] if row else None})
+                raise RequestError("ação não encontrada", 404)
+        except RequestError as error:
+            return self.reply(error.status, {"ok": False, "error": str(error), **error.details})
+        except Exception:
+            return self.reply(503, {"ok": False, "error": "serviço indisponível"})
+
+    def do_POST(self):
+        try:
+            self.check_origin()
+            payload = self.body()
+            with connect() as db:
+                ensure_schema(db)
+                action = self.action()
+                if action in ("register", "login"):
+                    return self.authenticate(db, action, payload)
                 if action == "logout":
                     token = self.session_token()
                     if token:
                         db.execute("DELETE FROM sessions WHERE token_hash=%s", (hashlib.sha256(token.encode()).hexdigest(),))
                         db.commit()
                     return self.reply(200, {"ok": True}, "pulseflow_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
-                return self.reply(404, {"ok": False, "error": "ação não encontrada"})
+                user = self.current_user(db)
+                if not user:
+                    raise RequestError("não autenticado", 401)
+                if action == "workspace":
+                    return self.save_workspace(db, user, payload)
+                if action in ("admin-account", "admin-user"):
+                    if user["role"] != "super_admin":
+                        raise RequestError("acesso restrito", 403)
+                    return self.update_account(db, user, payload) if action == "admin-account" else self.update_user(db, user, payload)
+                raise RequestError("ação não encontrada", 404)
+        except RequestError as error:
+            return self.reply(error.status, {"ok": False, "error": str(error), **error.details})
+        except psycopg.errors.UniqueViolation:
+            return self.reply(409, {"ok": False, "error": "e-mail já cadastrado"})
         except Exception:
             return self.reply(503, {"ok": False, "error": "serviço indisponível"})
 
-    def _create_session(self, db, user_id) -> None:
+    def authenticate(self, db, action, payload):
+        email, password = payload.get("email", ""), payload.get("password", "")
+        if not isinstance(email, str) or not isinstance(password, str) or len(email) > 254 or len(password) > 1024:
+            raise RequestError("e-mail ou senha inválidos")
+        email = email.strip().lower()
+        self.rate_limit(db, action, email)
+        if action == "register":
+            name, company = payload.get("name"), payload.get("company")
+            if not isinstance(name, str) or not name.strip() or len(name) > 160 or not isinstance(company, str) or not company.strip() or len(company) > 200:
+                raise RequestError("preencha nome e empresa")
+            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+                raise RequestError("informe um e-mail válido")
+            if len(password) < 8:
+                raise RequestError("a senha precisa ter pelo menos 8 caracteres")
+            if db.execute("SELECT 1 FROM users WHERE email=%s", (email,)).fetchone():
+                raise RequestError("e-mail já cadastrado", 409)
+            org_id, user_id = uuid.uuid4(), uuid.uuid4()
+            db.execute("INSERT INTO organizations(id,name,niche,whatsapp) VALUES(%s,%s,%s,%s)",
+                       (org_id, company.strip(), str(payload.get("niche", ""))[:160], str(payload.get("whatsapp", ""))[:32]))
+            db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'owner')",
+                       (user_id, org_id, name.strip(), email, password_hash(password)))
+            return self._create_session(db, user_id)
+        user = db.execute("SELECT u.* FROM users u LEFT JOIN organizations o ON o.id=u.organization_id WHERE u.email=%s AND u.status='active' AND (u.role='super_admin' OR o.status='active')", (email,)).fetchone()
+        encoded = user["password_hash"] if user else "pbkdf2_sha256$210000$00000000000000000000000000000000$" + "0" * 64
+        if not password_valid(password, encoded) or not user:
+            raise RequestError("e-mail ou senha inválidos", 401)
+        return self._create_session(db, user["id"])
+
+    def save_workspace(self, db, user, payload):
+        organization_id = self.allowed_organization(user, str(payload.get("organization_id", "")))
+        if not organization_id:
+            raise RequestError("conta não autorizada", 403)
+        revision = payload.get("revision")
+        if type(revision) is not int or revision < 0:
+            raise RequestError("recarregue a conta antes de salvar: revisão obrigatória", 428)
+        workspace = clean_workspace(payload.get("state"))
+        # The account lock also serializes first saves when no workspace row exists.
+        account = self.account(db, organization_id, locked=True)
+        require_permission(user, account, "workspace_write")
+        current = db.execute("SELECT state,revision FROM tenant_workspaces WHERE organization_id=%s FOR UPDATE", (organization_id,)).fetchone()
+        current_revision = current["revision"] if current else 0
+        if revision != current_revision:
+            raise RequestError("esta conta foi alterada em outra sessão; recarregue antes de salvar", 409, revision=current_revision)
+        previous = clean_workspace(current["state"]) if current else {}
+        if user["role"] != "super_admin" and not account["permissions"]["manage_settings"]:
+            if any(previous.get(key) != workspace.get(key) for key in SETTINGS_FIELDS):
+                raise RequestError("alteração de configurações não autorizada", 403)
+        encoded = json.dumps(workspace, ensure_ascii=False)
+        if len(encoded.encode()) > MAX_BODY_BYTES:
+            raise RequestError("dados da conta excedem o limite", 413)
+        saved = db.execute("""INSERT INTO tenant_workspaces(organization_id,state,revision,updated_at)
+            VALUES(%s,%s::jsonb,%s,NOW()) ON CONFLICT(organization_id) DO UPDATE
+            SET state=EXCLUDED.state,revision=EXCLUDED.revision,updated_at=NOW() RETURNING revision,updated_at""",
+                           (organization_id, encoded, current_revision + 1)).fetchone()
+        business = workspace.get("businessProfile", {})
+        number = workspace.get("whatsapp", {}).get("number", "")
+        niche = str(business.get("customNiche") or business.get("niche") or "")[:160]
+        company_name = str(workspace.get("whatsapp", {}).get("businessName") or account["name"]).strip()[:200] or account["name"]
+        db.execute("UPDATE organizations SET name=%s,niche=%s,whatsapp=%s WHERE id=%s", (company_name, niche, str(number)[:32], organization_id))
+        account["name"] = company_name
+        if user["role"] == "super_admin":
+            self.audit(db, user, organization_id, "support.workspace.updated", {"revision": saved["revision"], "changed_fields": sorted(key for key in set(previous) | set(workspace) if previous.get(key) != workspace.get(key))})
+        db.commit()
+        return self.reply(200, {"ok": True, "account": account, **saved})
+
+    def update_account(self, db, user, payload):
+        organization_id = organization_uuid(payload.get("organization_id"))
+        account = self.account(db, organization_id, locked=True)
+        changes = {}
+        if "status" in payload:
+            if payload["status"] not in ("active", "suspended"):
+                raise RequestError("status inválido")
+            changes["status"] = payload["status"]
+        if "plan" in payload:
+            if payload["plan"] not in ("Base", "Equipe"):
+                raise RequestError("plano inválido")
+            changes["plan"] = payload["plan"]
+        if "permissions" in payload:
+            permissions = payload["permissions"]
+            if not isinstance(permissions, dict) or any(key not in PERMISSIONS or type(value) is not bool for key, value in permissions.items()):
+                raise RequestError("permissões inválidas")
+            changes["permissions"] = {**account["permissions"], **permissions}
+        if not changes:
+            raise RequestError("informe uma alteração de conta")
+        account.update(changes)
+        db.execute("UPDATE organizations SET status=%s,plan=%s,permissions=%s::jsonb WHERE id=%s", (account["status"], account["plan"], json.dumps(account["permissions"]), organization_id))
+        if account["status"] == "suspended":
+            db.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE organization_id=%s)", (organization_id,))
+        self.audit(db, user, organization_id, "admin.account.updated", changes)
+        db.commit()
+        return self.reply(200, {"ok": True, "account": account, "status": account["status"]})
+
+    def update_user(self, db, user, payload):
+        user_id = organization_uuid(payload.get("user_id"))
+        status = payload.get("status")
+        if status not in ("active", "suspended"):
+            raise RequestError("status inválido")
+        target = db.execute("SELECT id,organization_id,role FROM users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        if not target:
+            raise RequestError("usuário não encontrado", 404)
+        if target["role"] == "super_admin":
+            raise RequestError("o acesso de administradores globais não pode ser alterado aqui", 403)
+        db.execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
+        if status == "suspended":
+            db.execute("DELETE FROM sessions WHERE user_id=%s", (user_id,))
+        self.audit(db, user, target["organization_id"], f"admin.user.{status}", {"user_id": user_id})
+        db.commit()
+        return self.reply(200, {"ok": True, "user_id": user_id, "status": status})
+
+    def _create_session(self, db, user_id):
         token = secrets.token_urlsafe(32)
         expires = utcnow() + timedelta(days=30)
+        db.execute("DELETE FROM sessions WHERE expires_at<=NOW()")
+        old_token = self.session_token()
+        if old_token:
+            db.execute("DELETE FROM sessions WHERE token_hash=%s", (hashlib.sha256(old_token.encode()).hexdigest(),))
+        db.execute("UPDATE users SET last_login_at=NOW() WHERE id=%s", (user_id,))
         db.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(%s,%s,%s)", (hashlib.sha256(token.encode()).hexdigest(), user_id, expires))
         user = db.execute("SELECT * FROM users WHERE id=%s", (user_id,)).fetchone()
+        account = self.account(db, user["organization_id"]) if user["organization_id"] else None
         db.commit()
         cookie = f"pulseflow_session={token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax"
-        self.reply(200, {"ok": True, "user": public_user(user)}, cookie)
+        return self.reply(200, {"ok": True, "user": public_user(user), "account": account}, cookie)

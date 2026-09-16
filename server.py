@@ -1,211 +1,130 @@
-"""PulseFlow local API — stdlib only.
+"""Local PulseFlow server: real API handlers, no mock data or public file listing.
 
-Run: python server.py
-Open: http://127.0.0.1:8787
-
-This service is deliberately provider-neutral. Replace the simulated outbound
-adapter with an official WhatsApp Business provider before using in production.
+Run ``python server.py`` and open http://127.0.0.1:8787.
+Install requirements.txt and configure the same database variables as production.
+The explicitly isolated UI test fixture is tests/serve_test.py, never this server.
 """
 from __future__ import annotations
 
+import importlib
 import json
-import os
-import secrets
-from datetime import datetime, timezone
-from http import HTTPStatus
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlsplit
 
-ROOT = Path(__file__).parent
-DATA_FILE = ROOT / "pulseflow-data.json"
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def seed() -> dict:
-    return {
-        "leads": [],
-        "integrations": {"whatsapp": False, "voip": False, "calendar": False, "crm": False},
-        "events": [],
-    }
-
-
-def load() -> dict:
-    if not DATA_FILE.exists():
-        return seed()
-    try:
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return seed()
+ROOT = Path(__file__).resolve().parent
+CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+)
+# An allowlist prevents accidental publication of source code, .env, .git or backups.
+PUBLIC_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/core.mjs": ("core.mjs", "text/javascript; charset=utf-8"),
+    "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+}
+API_MODULES = {
+    "/api/auth": "api.auth",
+    "/api/whatsapp": "api.whatsapp",
+    "/api/send-whatsapp": "api.send-whatsapp",
+}
 
 
-def save(data: dict) -> None:
-    temp = DATA_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, DATA_FILE)
-
-
-def event(data: dict, kind: str, payload: dict) -> None:
-    data["events"].append({"id": secrets.token_hex(6), "type": kind, "at": utcnow(), "payload": payload})
-
-
-class Handler(SimpleHTTPRequestHandler):
+class SecurityHeaders:
     def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Webhook-Secret")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Content-Security-Policy", CSP)
         super().end_headers()
 
-    def do_OPTIONS(self) -> None:
-        self.send_response(HTTPStatus.NO_CONTENT)
-        self.end_headers()
+    def log_message(self, message: str, *args) -> None:
+        # Do not log query strings, credentials, contact data or webhook payloads.
+        return
 
-    def body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self.fail("JSON inválido", HTTPStatus.BAD_REQUEST)
-            return {}
 
-    def reply(self, value: dict | list, status: HTTPStatus = HTTPStatus.OK) -> None:
-        raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+@lru_cache(maxsize=3)
+def api_handler(module_name: str):
+    module = importlib.import_module(module_name)
+    return type("LocalAPIHandler", (SecurityHeaders, module.handler), {})
+
+
+class Handler(SecurityHeaders, BaseHTTPRequestHandler):
+    server_version = "PulseFlowLocal"
+    sys_version = ""
+
+    def json_reply(self, status: int, data: dict) -> None:
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(raw)
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
-    def fail(self, message: str, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
-        self.reply({"error": message}, status)
+    def local_host(self) -> bool:
+        try:
+            hostname = urlsplit("http://" + self.headers.get("Host", "")).hostname
+        except ValueError:
+            return False
+        return hostname in {"localhost", "127.0.0.1", "::1"}
 
-    def route(self) -> list[str]:
-        return [x for x in urlparse(self.path).path.split("/") if x]
+    def dispatch(self) -> None:
+        if not self.local_host():
+            return self.json_reply(403, {"ok": False, "error": "servidor disponível apenas em localhost"})
+        path = unquote(urlsplit(self.path).path)
+        if path in API_MODULES:
+            if self.command not in {"GET", "POST"}:
+                return self.json_reply(405, {"ok": False, "error": "método não permitido"})
+            try:
+                handler_class = api_handler(API_MODULES[path])
+            except (ImportError, RuntimeError):
+                return self.json_reply(503, {"ok": False, "error": "dependências do backend ausentes; instale requirements.txt e configure o banco"})
+            # Reuse this parsed request, while resolving helpers on the real API class.
+            delegate = handler_class.__new__(handler_class)
+            delegate.__dict__ = self.__dict__
+            getattr(delegate, "do_" + self.command)()
+            return
+        if self.command not in {"GET", "HEAD"}:
+            return self.json_reply(405, {"ok": False, "error": "método não permitido"})
+        public = PUBLIC_FILES.get(path)
+        if not public or not (ROOT / public[0]).is_file():
+            return self.json_reply(404, {"ok": False, "error": "página não encontrada"})
+        raw = (ROOT / public[0]).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", public[1])
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
-    def do_GET(self) -> None:
-        parts = self.route()
-        if parts == ["api", "health"]:
-            return self.reply({"ok": True, "service": "pulseflow-api", "time": utcnow()})
-        if parts == ["api", "leads"]:
-            return self.reply(load()["leads"])
-        if parts == ["api", "events"]:
-            return self.reply(load()["events"][-100:])
-        if parts == ["api", "integrations"]:
-            return self.reply(load()["integrations"])
-        if parts == ["api", "whatsapp"]:
-            requirements = {
-                "verifyToken": bool(os.getenv("META_VERIFY_TOKEN")),
-                "appSecret": bool(os.getenv("META_APP_SECRET")),
-                "accessToken": bool(os.getenv("META_ACCESS_TOKEN")),
-                "phoneNumberId": bool(os.getenv("META_PHONE_NUMBER_ID")),
-                "wabaId": bool(os.getenv("META_WABA_ID")),
-                "graphVersion": bool(os.getenv("META_GRAPH_VERSION")),
-            }
-            return self.reply({"ok": True, "service": "pulseflow-whatsapp-webhook", "configured": all(requirements.values()), "requirements": requirements, "eventSinkConfigured": False, "groupMode": "restricted_official_groups_api", "local": True})
-        if parts == ["api", "send-whatsapp"]:
-            requirements = {"accessToken": False, "phoneNumberId": False, "graphVersion": False, "internalKey": False}
-            return self.reply({"ok": True, "service": "pulseflow-whatsapp-send", "configured": False, "requirements": requirements, "local": True})
-        return super().do_GET()
-
-    def do_POST(self) -> None:
-        parts, payload = self.route(), self.body()
-        if parts == ["api", "leads"]:
-            required = ["name", "phone"]
-            if any(not payload.get(field) for field in required):
-                return self.fail("name e phone são obrigatórios")
-            data = load()
-            lead = {
-                "id": secrets.token_hex(8), "name": payload["name"], "phone": payload["phone"],
-                "origin": payload.get("origin", "Não informado"), "interest": payload.get("interest", "Média"),
-                "stage": payload.get("stage", "new"), "notes": payload.get("notes", ""),
-                "callDone": False, "automationPaused": False, "createdAt": utcnow(), "messages": [],
-            }
-            data["leads"].append(lead)
-            event(data, "lead.created", {"leadId": lead["id"]})
-            save(data)
-            return self.reply(lead, HTTPStatus.CREATED)
-        if len(parts) == 4 and parts[:2] == ["api", "leads"] and parts[3] == "messages":
-            data, lead_id = load(), parts[2]
-            lead = next((x for x in data["leads"] if x["id"] == lead_id), None)
-            if not lead:
-                return self.fail("Lead não encontrado", HTTPStatus.NOT_FOUND)
-            if not payload.get("text"):
-                return self.fail("text é obrigatório")
-            if payload.get("direction", "out") == "out" and not lead.get("callDone"):
-                return self.fail("Uma ligação deve ser registrada antes da primeira mensagem", HTTPStatus.CONFLICT)
-            msg = {"id": secrets.token_hex(6), "text": payload["text"], "direction": payload.get("direction", "out"), "at": utcnow()}
-            lead["messages"].append(msg)
-            if msg["direction"] == "in":
-                lead["automationPaused"] = True
-                event(data, "lead.replied", {"leadId": lead_id, "notifySeller": True, "automationPaused": True})
-            else:
-                event(data, "message.sent", {"leadId": lead_id, "provider": payload.get("provider", "simulated")})
-            save(data)
-            return self.reply(msg, HTTPStatus.CREATED)
-        if parts == ["api", "webhooks", "whatsapp"]:
-            # Expected: {"leadId":"...","text":"...","from":"+55..."}
-            data = load()
-            lead = next((x for x in data["leads"] if x["id"] == payload.get("leadId")), None)
-            if not lead:
-                return self.fail("Lead do webhook não encontrado", HTTPStatus.NOT_FOUND)
-            lead["messages"].append({"id": secrets.token_hex(6), "text": payload.get("text", ""), "direction": "in", "at": utcnow()})
-            lead["automationPaused"] = True
-            event(data, "lead.replied", {"leadId": lead["id"], "notifySeller": True, "automationPaused": True})
-            save(data)
-            return self.reply({"received": True, "automationPaused": True, "notifySeller": True})
-        if parts == ["api", "webhooks", "voip"]:
-            data = load()
-            lead = next((x for x in data["leads"] if x["id"] == payload.get("leadId")), None)
-            if not lead:
-                return self.fail("Lead do webhook não encontrado", HTTPStatus.NOT_FOUND)
-            lead["callDone"] = payload.get("status") in {"completed", "answered"}
-            event(data, "call.completed", {"leadId": lead["id"], "status": payload.get("status")})
-            save(data)
-            return self.reply({"received": True, "callDone": lead["callDone"]})
-        if parts == ["api", "send-whatsapp"]:
-            if not payload.get("consentConfirmed"):
-                return self.fail("consentimento do contato não confirmado", HTTPStatus.CONFLICT)
-            if not payload.get("callCompleted"):
-                return self.fail("registre a ligação antes da mensagem", HTTPStatus.CONFLICT)
-            if not payload.get("to") or not payload.get("text"):
-                return self.fail("to e text são obrigatórios")
-            return self.reply({"sent": True, "provider": "local-simulation", "to": payload["to"], "rules": {"consentConfirmed": True, "callCompleted": True}})
-        if len(parts) == 3 and parts[:2] == ["api", "integrations"]:
-            data = load()
-            provider = parts[2]
-            if provider not in data["integrations"]:
-                return self.fail("Integração desconhecida", HTTPStatus.NOT_FOUND)
-            # Do not persist actual credentials here. Use a secret manager in production.
-            data["integrations"][provider] = bool(payload.get("enabled", True))
-            event(data, "integration.updated", {"provider": provider, "enabled": data["integrations"][provider]})
-            save(data)
-            return self.reply({"provider": provider, "connected": data["integrations"][provider]})
-        return self.fail("Rota não encontrada", HTTPStatus.NOT_FOUND)
-
-    def do_PATCH(self) -> None:
-        parts, payload = self.route(), self.body()
-        if len(parts) == 3 and parts[:2] == ["api", "leads"]:
-            data = load()
-            lead = next((x for x in data["leads"] if x["id"] == parts[2]), None)
-            if not lead:
-                return self.fail("Lead não encontrado", HTTPStatus.NOT_FOUND)
-            allowed = {"stage", "interest", "origin", "notes", "discardReason", "recoveryAt", "callDone"}
-            lead.update({k: v for k, v in payload.items() if k in allowed})
-            event(data, "lead.updated", {"leadId": lead["id"], "fields": list(set(payload) & allowed)})
-            save(data)
-            return self.reply(lead)
-        return self.fail("Rota não encontrada", HTTPStatus.NOT_FOUND)
+    do_GET = dispatch
+    do_HEAD = dispatch
+    do_POST = dispatch
+    do_PUT = dispatch
+    do_PATCH = dispatch
+    do_DELETE = dispatch
+    do_OPTIONS = dispatch
 
 
-if __name__ == "__main__":
-    os.chdir(ROOT)
+def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 8787), Handler)
-    print("PulseFlow running at http://127.0.0.1:8787")
+    print("PulseFlow local: http://127.0.0.1:8787 (APIs reais; banco configurado necessário)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nPulseFlow stopped")
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,66 +1,97 @@
-# PulseFlow SaaS
+# PulseFlow
 
-MVP funcional de uma camada de execução de follow-up. O PulseFlow não pretende substituir o CRM: ele conecta canais e sistemas existentes para garantir que cada lead receba a próxima ação certa, no tempo certo e com contexto.
+Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar o vendedor a decidir **quem contatar, quando e com qual contexto**, mantendo a versão de entrada simples e sem substituir um CRM completo.
 
-## Princípio do produto
+## Escopo real desta versão
 
-- O Pipeline organiza o trabalho de follow-up, sem duplicar o cadastro completo do CRM;
-- Cada coluna tem SLA, IA observadora, IA operadora e automações independentes;
-- A IA observadora analisa conversas e notas, mas não envia mensagens;
-- A IA operadora sugere, executa com aprovação ou opera automaticamente, conforme a autonomia escolhida;
-- Notas, valor do contrato e próxima ação mantêm apenas o contexto necessário para executar o acompanhamento;
-- CRM, WhatsApp, VoIP e agenda continuam sendo integrados como fontes e destinos externos.
+- Cadastro e login por e-mail com sessões no servidor e PostgreSQL.
+- Contas separadas por empresa. Os dados operacionais são salvos no banco; não dependem de um cadastro fictício no navegador.
+- Contatos, pipelines, notas, próximos contatos, registro manual de ligações, valores comerciais e roteiros por nicho.
+- Salvamento com revisão: quando duas sessões alteram a mesma conta, uma versão antiga não pode sobrescrever silenciosamente a mais recente.
+- Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. Ações administrativas são auditadas.
+- Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
+- Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
 
-## O que está implementado
+### Mensagens e agenda
 
-- Login/cadastro de demonstração e período grátis;
-- Dashboard operacional com parâmetros da plataforma, pipeline drag-and-drop e colunas totalmente configuráveis;
-- IA observadora, IA operadora e conjunto de automações configuráveis por coluna;
-- Leads com origem, interesse, nicho, faturamento, notas e motivo de descarte;
-- Área de notas, produto, preço do contrato, status comercial e próxima ação acessível diretamente pelo Pipeline;
-- Coach de vendas que consolida mensagens, notas e ligações para estimar consciência, momento de compra, perguntas de descoberta, retomadas e condução para reunião;
-- Pipeline de pós-venda com apenas IA observadora, sinais de conversas diretas e grupos autorizados, saúde do cliente, risco e oportunidade de expansão;
-- Conversas em estilo WhatsApp, templates, registro de ligação obrigatório antes da primeira mensagem e respostas simuladas;
-- Cadência configurável por horas/dias, automação por etapa e recuperação contextual;
-- Lembretes, remarketing/abandonados, agente de IA por nicho, administração e planos;
-- Conectores configuráveis para WhatsApp Business, VoIP, Google Agenda e CRMs.
+No modo manual, cadastrar um número **não conecta nem espelha o WhatsApp**. O sistema prepara a mensagem, abre a conversa no WhatsApp e mantém o acompanhamento. Abrir o WhatsApp não confirma entrega: o vendedor precisa confirmar o que efetivamente enviou. Uma ligação registrada é obrigatória antes do primeiro contato por mensagem; contatos que pediram para não receber mensagens devem permanecer bloqueados.
 
-## Produção: integrações e backend
+Agendamentos e cadências organizam as próximas ações. Esta versão não inclui um trabalhador de fila ou cron de envio contínuo em segundo plano. Uma tarefa vencida não significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
 
-Para produção, mantenha esta interface e conecte os botões de integração a um backend. O backend deve:
+### Sugestões e inteligência artificial
 
-1. Armazenar dados em banco (Postgres, por exemplo) e autenticar usuários;
-2. Criptografar tokens dos provedores e usar apenas a WhatsApp Cloud API ou parceiro oficial;
-3. Receber `message.received` via webhook, pausar cadência, salvar mensagem e notificar o vendedor;
-4. Executar cadências em uma fila/agendador (BullMQ/Temporal/Cloud Tasks) respeitando janelas de contato, opt-out e a regra de ligação;
-5. Receber eventos de VoIP e Google Agenda para registrar chamadas e reuniões;
-6. Expor API REST/Webhooks para CRM externo e auditoria de todas as alterações.
+Os roteiros por nicho e sugestões locais ajudam o vendedor a escrever o primeiro contato, acompanhamento e fechamento. Eles não representam uma IA acompanhando todas as conversas ou ouvindo ligações. Análise por modelo de IA, transcrição de áudio e aprendizagem entre atendimentos precisam de uma integração adicional, isolamento de dados por empresa e limites de consumo. O pós-venda é somente de acompanhamento: o envio operacional permanece bloqueado.
 
-### WhatsApp oficial incluído
+### Planos e serviços externos
 
-O projeto inclui duas Vercel Functions:
+Os valores de referência são **Base: R$ 9,90/mês** e **Equipe: R$ 29,90/mês**. A cobrança, assinatura e cancelamento automático por um processador de pagamento não estão integrados. A alteração de plano pelo administrador é operacional; não efetua uma cobrança.
 
-- `GET|POST /api/whatsapp`: verificação do webhook da Meta, validação HMAC da assinatura, normalização de mensagens diretas e eventos da Groups API;
-- `GET|POST /api/send-whatsapp`: envio pela Cloud API, protegido por chave interna e bloqueado sem consentimento ou ligação registrada.
+O consumo do WhatsApp oficial pertence à conta Meta do cliente. O PulseFlow não acrescenta uma mensalidade de API. Google Agenda, VoIP e outros CRMs ainda precisam de conectores e autorizações próprios; registrar manualmente uma reunião ou ligação não ativa essas integrações.
 
-Configure na Vercel: `META_VERIFY_TOKEN`, `META_APP_SECRET`, `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_WABA_ID`, `META_GRAPH_VERSION` e `PULSEFLOW_INTERNAL_API_KEY`. Para persistir os eventos recebidos, configure também `PULSEFLOW_EVENT_SINK_URL` e, opcionalmente, `PULSEFLOW_EVENT_SINK_KEY`.
+## Executar localmente com o backend real
 
-Credenciais nunca são armazenadas no navegador. A Groups API é uma capacidade oficial restrita: exige elegibilidade e aprovação da Meta, usa grupos compatíveis criados/administrados pela API e não deve ser tratada como acesso geral a qualquer grupo existente do aplicativo.
+Requisitos: Python 3.12 ou superior, PostgreSQL acessível e as dependências de `requirements.txt`.
 
-## API local incluída
+```sh
+python -m pip install -r requirements.txt
+python server.py
+```
 
-Com Python 3 instalado, execute `python server.py` e acesse `http://127.0.0.1:8787`.
+Abra `http://127.0.0.1:8787`. O servidor importa os mesmos handlers de autenticação e WhatsApp usados em produção. Ele escuta apenas em localhost, não habilita CORS global, não lista pastas e só serve os arquivos públicos necessários ao frontend.
 
-- `GET /api/health`, `GET|POST /api/leads`, `PATCH /api/leads/:id`;
-- `POST /api/leads/:id/messages` — bloqueia a primeira mensagem se não houver chamada registrada;
-- `POST /api/webhooks/whatsapp` — registra resposta, pausa automação e sinaliza notificação;
-- `POST /api/webhooks/voip` — registra uma ligação concluída;
-- `GET /api/events` e `GET|POST /api/integrations/:provider`.
+Variáveis de ambiente:
 
-Os endpoints são intencionalmente locais e usam arquivo JSON para permitir demonstração sem instalar banco ou serviços. Antes de produção, adicione autenticação, banco de dados, cofre de segredos, validação de assinatura de webhook, consentimento/opt-out e limites de envio.
+| Variável | Uso |
+| --- | --- |
+| `DATABASE_URL` ou `STORAGE_URL` | Conexão PostgreSQL. Usar banco separado para desenvolvimento. |
+| `PULSEFLOW_APP_URL` | Endereço público HTTPS do SaaS; usado para origem e webhook. |
+| `PULSEFLOW_ADMIN_EMAIL` | E-mail do administrador inicial. |
+| `PULSEFLOW_ADMIN_PASSWORD` | Senha forte do administrador inicial, fornecida como segredo no servidor. |
+| `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp. Manter backup seguro. |
+| `META_GRAPH_VERSION` | Versão da Graph API adotada pela integração, quando configurada. |
 
-## Publicar no Vercel
+Não colocar senhas, tokens ou URLs privadas do banco no JavaScript, no repositório ou em capturas de tela. Trocar a chave de criptografia sem migrar as credenciais existentes impede que elas sejam decifradas. As variáveis administrativas inicializam o administrador; não são uma tela de alteração de senha para usuários existentes.
 
-Importe esta pasta em um repositório GitHub e, no painel Vercel, escolha **Other / Static site** sem comando de build. O arquivo de entrada é `index.html`.
+Sem banco ou dependências, o servidor local informa indisponibilidade. Ele não substitui silenciosamente o banco por um JSON ou por dados de demonstração.
 
-> As conexões mostradas no MVP são demonstrativas: credenciais reais e autorização das contas dos provedores são necessárias para ativá-las.
+## Testes de interface isolados
+
+Para desenvolver a interface sem tocar no banco ou em contas reais:
+
+```sh
+python tests/serve_test.py --test-only
+```
+
+Abra `http://127.0.0.1:8788`. Esse processo é **uma fixture de teste local em memória**, com dados apagados ao reiniciar e provedores externos desativados. Não deve ser publicado nem usado como armazenamento do produto.
+
+- Vendedor: `seller@example.test`
+- Administrador: `admin@example.test`
+- Senha de ambas as fixtures locais: `PulseFlow-local-2026!`
+
+O contrato de teste cobre login, cadastro, sessões, dados por empresa, conflito de revisões, suporte e suspensão de acesso. Ele permite testar a interface, mas **não comprova persistência PostgreSQL nem entrega por WhatsApp**. Esses pontos exigem validação com serviços reais configurados. Os testes de segurança dos handlers ficam separados das fixtures de navegação.
+
+## Integrar o WhatsApp oficial
+
+A integração usa a WhatsApp Cloud API e depende de um aplicativo Meta configurado, conta WhatsApp Business, número habilitado e permissões válidas. A verificação do cadastro de desenvolvedor e do número deve ser concluída na Meta pelo titular da conta.
+
+Na configuração do WhatsApp da empresa, informar o identificador do número, o identificador da conta comercial, o token de acesso autorizado, o segredo do aplicativo e um token de verificação de webhook. Usar o endereço de webhook mostrado pelo sistema na configuração da Meta e assinar o evento de mensagens.
+
+- `GET /api/whatsapp?action=connection`: estado da conexão, sem revelar credenciais.
+- `GET /api/whatsapp?action=messages`: mensagens da empresa autenticada.
+- `POST /api/whatsapp?action=connect`: salva a configuração cifrada.
+- `POST /api/whatsapp?action=validate`: verifica a configuração no provedor.
+- `POST /api/whatsapp?action=send`: envio autorizado, sujeito às regras comerciais e à resposta real da Meta.
+- `GET|POST /api/whatsapp?action=webhook`: verificação e recebimento de eventos com validação de assinatura.
+- `/api/send-whatsapp`: endpoint legado desativado; não utilizar.
+
+O webhook passa a armazenar mensagens recebidas após a conexão válida. Não existe importação geral do histórico antigo, espelhamento de qualquer grupo do aplicativo ou conexão por QR Code não oficial. Envios fora das condições aceitas pela Meta devem ser bloqueados; suporte a templates aprovados depende dos tipos de envio realmente implementados no handler.
+
+## Publicação e validação
+
+Testes automatizados sem serviços externos: `node --test tests/core.test.mjs` e `python -m unittest discover -s tests -p "test_*.py"`. Os testes de interface em `tests/ui.test.cjs` usam Playwright e o servidor isolado na porta 8788, sem enviar mensagens reais. As capturas geradas ficam fora do Git e da publicação.
+
+O frontend usa HTML, CSS e JavaScript sem bibliotecas de interface externas. Na Vercel, os handlers Python ficam em `api/` e as dependências em `requirements.txt`. Configure as variáveis nos ambientes corretos e use banco separado para previews.
+
+`vercel.json` aplica uma política de conteúdo da mesma origem, bloqueia enquadramento por outros sites e desabilita recursos de câmera, microfone e localização que a interface não utiliza. Não publicar fixtures, arquivos de ambiente, cópias locais ou diretórios de testes.
+
+Antes de liberar uma versão para clientes, validar cadastro e login, reabertura dos dados em outra sessão, isolamento entre duas empresas, conflito de gravação, controles do administrador e os fluxos no celular. Entrega real de mensagens só está validada quando houver credenciais Meta e um evento de resposta do provedor — aprovação visual ou gravação local não equivalem a envio.

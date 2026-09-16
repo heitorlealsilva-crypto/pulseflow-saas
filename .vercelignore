@@ -1,0 +1,9 @@
+tests/
+server.py
+README.md
+__pycache__/
+**/__pycache__/
+*.pyc
+.env*
+artifacts/
+node_modules/

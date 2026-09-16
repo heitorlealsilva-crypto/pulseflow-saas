@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+tests/*.png
+.vercel/
+.env*
+node_modules/
