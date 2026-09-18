@@ -16,11 +16,13 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 
 No modo manual, cadastrar um número **não conecta nem espelha o WhatsApp**. O sistema prepara a mensagem, abre a conversa no WhatsApp e mantém o acompanhamento. Abrir o WhatsApp não confirma entrega: o vendedor precisa confirmar o que efetivamente enviou. Uma ligação registrada é obrigatória antes do primeiro contato por mensagem; contatos que pediram para não receber mensagens devem permanecer bloqueados.
 
-Agendamentos e cadências organizam as próximas ações. Esta versão não inclui um trabalhador de fila ou cron de envio contínuo em segundo plano. Uma tarefa vencida não significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
+Agendamentos, cadências e regras de automação organizam as próximas ações. As regras são avaliadas quando o espaço é aberto e quando chegam eventos compatíveis; esta versão não inclui um trabalhador de fila ou cron de envio contínuo em segundo plano. O agente pode preparar uma sugestão para revisão, mas uma tarefa vencida nunca significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
 
 ### Sugestões e inteligência artificial
 
-Os roteiros por nicho e sugestões locais ajudam o vendedor a escrever o primeiro contato, acompanhamento e fechamento. Eles não representam uma IA acompanhando todas as conversas ou ouvindo ligações. Análise por modelo de IA, transcrição de áudio e aprendizagem entre atendimentos precisam de uma integração adicional, isolamento de dados por empresa e limites de consumo. O pós-venda é somente de acompanhamento: o envio operacional permanece bloqueado.
+Cada empresa pode configurar seu agente, tom, objetivo, instruções da observadora, instruções da operadora, retenção de memória e regras na área **Automações**. O sistema registra sinais estruturados das conversas e das notas de ligações confirmadas, sempre dentro do espaço da própria empresa, e usa esses registros para dar contexto às próximas sugestões. Isso é memória operacional por regras, não treinamento dos pesos de um modelo nem aprendizagem cruzada entre clientes.
+
+Os roteiros por nicho e sugestões locais continuam funcionando sem custo de modelo. A análise semântica por um modelo de IA, transcrição de áudio e interpretação automática de chamadas ainda dependem de um provedor configurado no servidor e de limites de consumo. No pós-venda, o agente é somente observador; o envio operacional permanece bloqueado. Em todos os pipelines, a operadora trabalha em modo `suggest_only`: o vendedor revisa e autoriza qualquer mensagem.
 
 ### Planos e serviços externos
 

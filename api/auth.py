@@ -21,13 +21,15 @@ MAX_BODY_BYTES = 2_000_000
 PERMISSIONS = ("workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage")
 WORKSPACE_TYPES = {
     "leads": list, "columns": list, "postSaleColumns": list, "cadence": list,
+    "automations": list, "automationRuns": list,
     "reminders": list, "notifications": list, "manualApprovals": list,
     "postSaleCustomers": list, "whatsappImported": list,
     "whatsapp": dict, "businessProfile": dict, "ai": dict, "settings": dict,
     "integrations": dict, "templates": dict, "pipelineBoard": str,
     "schemaVersion": int, "manualCadenceVersion": int,
 }
-SETTINGS_FIELDS = {"columns", "postSaleColumns", "cadence", "whatsapp", "businessProfile", "ai", "settings", "integrations", "templates"}
+SETTINGS_FIELDS = {"columns", "postSaleColumns", "cadence", "automations", "whatsapp", "businessProfile", "settings", "integrations", "templates"}
+AI_RUNTIME_FIELDS = {"memories", "feedback", "lastLearnedAt"}
 SECRET_FIELDS = {"password", "passwordhash", "token", "accesstoken", "refreshtoken", "appsecret", "verifytoken", "apikey", "secret", "authorization", "cookie", "session", "credentials", "accesstokenenc", "appsecretenc"}
 _SCHEMA_READY_FOR = None
 
@@ -432,7 +434,9 @@ class handler(BaseHTTPRequestHandler):
             raise RequestError("esta conta foi alterada em outra sessão; recarregue antes de salvar", 409, revision=current_revision)
         previous = clean_workspace(current["state"]) if current else {}
         if user["role"] != "super_admin" and not account["permissions"]["manage_settings"]:
-            if any(previous.get(key) != workspace.get(key) for key in SETTINGS_FIELDS):
+            previous_ai = {key: value for key, value in previous.get("ai", {}).items() if key not in AI_RUNTIME_FIELDS}
+            workspace_ai = {key: value for key, value in workspace.get("ai", {}).items() if key not in AI_RUNTIME_FIELDS}
+            if any(previous.get(key) != workspace.get(key) for key in SETTINGS_FIELDS) or previous_ai != workspace_ai:
                 raise RequestError("alteração de configurações não autorizada", 403)
         encoded = json.dumps(workspace, ensure_ascii=False)
         if len(encoded.encode()) > MAX_BODY_BYTES:
