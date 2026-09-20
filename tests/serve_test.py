@@ -221,8 +221,8 @@ class Handler(StaticHandler):
                 return self.reply(200, {"ok": True, "user": public_user(user), "account": STORE["accounts"].get(user["organization_id"])})
             if self.command == "GET" and action == "team":
                 account = self.requested_account(user, query.get("organization_id"))
-                if not account or user["role"] not in ("owner", "super_admin"):
-                    return self.fail(403, "somente o proprietário pode gerenciar a equipe")
+                if not account or not self.allowed(user, account, "workspace_read"):
+                    return self.fail(403, "conta não autorizada")
                 members = [public_user(item) | {"last_login_at": item.get("last_login_at"), "created_at": item.get("created_at")} for item in STORE["users"].values() if item["organization_id"] == account["id"]]
                 return self.reply(200, {"ok": True, "members": members, "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
             if action == "workspace":

@@ -343,10 +343,8 @@ class handler(BaseHTTPRequestHandler):
                     organization_id = self.allowed_organization(user, self.requested_organization())
                     if not organization_id:
                         raise RequestError("conta não autorizada", 403)
-                    if user["role"] not in ("owner", "super_admin"):
-                        raise RequestError("somente o proprietário pode gerenciar a equipe", 403)
                     account = self.account(db, organization_id)
-                    require_permission(user, account, "manage_settings")
+                    require_permission(user, account, "workspace_read")
                     members = db.execute("""SELECT id,name,email,role,status,last_login_at,created_at
                         FROM users WHERE organization_id=%s ORDER BY role='owner' DESC,created_at""", (organization_id,)).fetchall()
                     return self.reply(200, {"ok": True, "members": members,
