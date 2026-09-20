@@ -30,6 +30,7 @@ PUBLIC_FILES = {
 }
 API_MODULES = {
     "/api/auth": "api.auth",
+    "/api/ai": "api.ai",
     "/api/whatsapp": "api.whatsapp",
     "/api/worker": "api.worker",
     "/api/send-whatsapp": "api.send-whatsapp",

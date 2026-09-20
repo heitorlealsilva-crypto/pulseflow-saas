@@ -24,7 +24,7 @@ O projeto inclui um cron diário compatível com a Vercel Hobby. Esse plano não
 
 Cada empresa pode configurar seu agente, tom, objetivo, instruções da observadora, instruções da operadora, retenção de memória e regras na área **Automações**. O sistema registra sinais estruturados das conversas e das notas de ligações confirmadas, sempre dentro do espaço da própria empresa, e usa esses registros para dar contexto às próximas sugestões. Isso é memória operacional por regras, não treinamento dos pesos de um modelo nem aprendizagem cruzada entre clientes.
 
-Os roteiros por nicho e sugestões locais continuam funcionando sem custo de modelo. A análise semântica por um modelo de IA, transcrição de áudio e interpretação automática de chamadas ainda dependem de um provedor configurado no servidor e de limites de consumo. No pós-venda, o agente é somente observador; o envio operacional permanece bloqueado. Em todos os pipelines, a operadora trabalha em modo `suggest_only`: o vendedor revisa e autoriza qualquer mensagem.
+Os roteiros por nicho e sugestões locais continuam funcionando sem custo de modelo. Quando `OPENAI_API_KEY` está configurada, o vendedor pode solicitar uma análise semântica real dentro da conversa. O backend envia somente contexto limitado e sem telefone/e-mail, não permite armazenamento no provedor, guarda a análise na empresa correta e aplica um limite diário por plano. Transcrição de áudio e interpretação automática de chamadas ainda não estão disponíveis. No pós-venda, o agente é somente observador; o envio operacional permanece bloqueado. Em todos os pipelines, a operadora trabalha em modo `suggest_only`: o vendedor revisa e autoriza qualquer mensagem.
 
 ### Planos e serviços externos
 
@@ -54,6 +54,8 @@ Variáveis de ambiente:
 | `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp. Manter backup seguro. |
 | `META_GRAPH_VERSION` | Versão da Graph API adotada pela integração, quando configurada. |
 | `CRON_SECRET` | Segredo com pelo menos 16 caracteres, enviado como `Authorization: Bearer ...` pelo cron ou agendador externo. |
+| `OPENAI_API_KEY` | Chave do projeto OpenAI usada somente pelo backend para analisar conversas. |
+| `OPENAI_MODEL` | Modelo de análise; o padrão é `gpt-5.6-luna`. |
 
 Não colocar senhas, tokens ou URLs privadas do banco no JavaScript, no repositório ou em capturas de tela. Trocar a chave de criptografia sem migrar as credenciais existentes impede que elas sejam decifradas. As variáveis administrativas inicializam o administrador; não são uma tela de alteração de senha para usuários existentes.
 

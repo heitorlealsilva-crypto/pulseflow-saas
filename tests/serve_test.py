@@ -155,6 +155,35 @@ class Handler(StaticHandler):
                 if self.command == "GET" and action == "messages":
                     return self.reply(200, {"ok": True, "messages": [], "contacts": [], "connected": False})
                 return self.fail(503, "ambiente de teste local: provedores externos desativados")
+            if parsed.path == "/api/ai":
+                if not user:
+                    return self.fail(401, "não autenticado")
+                account = self.requested_account(user, query.get("organization_id") or payload.get("organization_id"))
+                if not account:
+                    return self.fail(403, "conta não autorizada")
+                if self.command == "GET" and action == "status":
+                    return self.reply(200, {"ok": True, "configured": True, "model": "fixture-only",
+                        "mode": "suggest_only", "used_today": 0, "daily_limit": 10, "remaining_today": 10})
+                if self.command == "POST" and action == "analyze":
+                    current = STORE["workspaces"].get(account["id"], {"workspace": {}})["workspace"] or {}
+                    lead = next((item for item in current.get("leads", []) if item.get("id") == payload.get("lead_id")), None)
+                    if not lead:
+                        return self.fail(404, "contato não encontrado")
+                    if not current.get("ai", {}).get("enabled"):
+                        return self.fail(409, "ative o agente")
+                    return self.reply(200, {"ok": True, "analysis_id": identifier(), "model": "fixture-only",
+                        "used_today": 1, "daily_limit": 10, "analysis": {
+                            "summary": "O cliente demonstrou interesse e indicou um horário preferido.",
+                            "stage": "Em atendimento", "intent": "Agendar o próximo passo",
+                            "awareness": "Reconhece a necessidade", "objections": [],
+                            "signals": ["Interesse confirmado", "Preferência por sexta-feira"],
+                            "recommended_next_action": "message",
+                            "suggested_message": "Posso reservar um horário na sexta-feira para você?",
+                            "follow_up_reason": "Transformar o interesse em um compromisso claro.",
+                            "follow_up_after_hours": 24, "confidence": 0.91,
+                            "memory_facts": ["Prefere atendimento na sexta-feira"],
+                            "observation_only": False, "requires_seller_approval": True}})
+                return self.fail(404, "ação não encontrada")
             if parsed.path != "/api/auth":
                 return self.fail(404, "ação não encontrada")
             if self.command == "GET" and action == "health":
