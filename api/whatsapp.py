@@ -237,15 +237,18 @@ def send_guard(workspace, payload, latest_inbound=None, now=None):
 
 
 def connection_payload(row, organization_id):
-    public = {key: row.get(key) for key in PUBLIC_CONNECTION_FIELDS} if row else None
-    ready = bool(row and row.get("meta_verified_at") and row.get("webhook_verified_at"))
+    credentials_saved = bool(row and row.get("phone_number_id") and row.get("waba_id")
+                             and row.get("access_token_enc") and row.get("app_secret_enc"))
+    public = {key: row.get(key) for key in PUBLIC_CONNECTION_FIELDS} if credentials_saved else None
+    ready = bool(credentials_saved and row.get("meta_verified_at") and row.get("webhook_verified_at"))
     encryption_ready = len(os.getenv("PULSEFLOW_ENCRYPTION_KEY", "")) >= 32
     meta_verified = bool(row and row.get("meta_verified_at"))
     webhook_verified = bool(row and row.get("webhook_verified_at"))
     if public:
         public["status"] = "ready" if ready else "configured"
     base = os.getenv("PULSEFLOW_APP_URL", DEFAULT_APP_URL).rstrip("/")
-    return {"ok": True, "configured": bool(row), "ready": ready, "connected": ready,
+    return {"ok": True, "configured": credentials_saved, "webhook_prepared": bool(row),
+            "ready": ready, "connected": ready,
             "encryption_ready": encryption_ready,
             "connection": public, "groups_supported": False,
             "setup": {
@@ -406,6 +409,8 @@ class handler(BaseHTTPRequestHandler):
                     return self.handle_webhook(db, query.get("organization_id", ""), payload)
                 permission = "whatsapp_send" if query.get("action") == "send" else "whatsapp_manage"
                 user, organization_id = self.authenticated_org(db, str(payload.get("organization_id", "")), permission)
+                if query.get("action") == "prepare-webhook":
+                    return self.prepare_webhook(db, organization_id, payload)
                 if query.get("action") == "connect":
                     return self.save_connection(db, organization_id, payload)
                 if query.get("action") == "validate":
@@ -446,7 +451,10 @@ class handler(BaseHTTPRequestHandler):
             ON CONFLICT(organization_id) DO UPDATE SET phone_number_id=EXCLUDED.phone_number_id,waba_id=EXCLUDED.waba_id,
             business_number=EXCLUDED.business_number,access_token_enc=EXCLUDED.access_token_enc,app_secret_enc=EXCLUDED.app_secret_enc,
             verify_token_hash=EXCLUDED.verify_token_hash,graph_version=EXCLUDED.graph_version,status='configured',
-            meta_verified_at=NULL,webhook_verified_at=NULL,last_event_at=NULL,updated_at=NOW()""",
+            meta_verified_at=NULL,
+            webhook_verified_at=CASE WHEN whatsapp_connections.verify_token_hash=EXCLUDED.verify_token_hash
+                THEN whatsapp_connections.webhook_verified_at ELSE NULL END,
+            last_event_at=NULL,updated_at=NOW()""",
             (organization_id, phone_id, waba_id, str(payload.get("business_number", ""))[:40],
              encryption.encrypt(payload["access_token"].strip().encode()).decode(), encryption.encrypt(payload["app_secret"].strip().encode()).decode(),
              hashlib.sha256(payload["verify_token"].encode()).hexdigest(), version))
@@ -468,6 +476,25 @@ class handler(BaseHTTPRequestHandler):
             result["warning"] = warning
             result["validation_code"] = validation_code
         return self.reply(200, result)
+
+    def prepare_webhook(self, db, organization_id, payload):
+        token = payload.get("verify_token")
+        if not isinstance(token, str) or not 20 <= len(token) <= 512:
+            raise IntegrationError("Use um token de verificação entre 20 e 512 caracteres.", "invalid_verify_token", 400)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        db.execute("""INSERT INTO whatsapp_connections(
+                organization_id,phone_number_id,waba_id,business_number,access_token_enc,app_secret_enc,
+                verify_token_hash,graph_version,status)
+            VALUES(%s,'','','','','',%s,'v23.0','webhook_prepared')
+            ON CONFLICT(organization_id) DO UPDATE SET
+                verify_token_hash=EXCLUDED.verify_token_hash,
+                webhook_verified_at=CASE WHEN whatsapp_connections.verify_token_hash=EXCLUDED.verify_token_hash
+                    THEN whatsapp_connections.webhook_verified_at ELSE NULL END,
+                status=CASE WHEN whatsapp_connections.phone_number_id<>'' THEN 'configured' ELSE 'webhook_prepared' END,
+                updated_at=NOW()""", (organization_id, digest))
+        db.commit()
+        row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
+        return self.reply(200, connection_payload(row, organization_id))
 
     def handle_webhook(self, db, organization_id, payload):
         organization_id = normalized_uuid(organization_id)

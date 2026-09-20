@@ -111,12 +111,16 @@ class SecurityTests(unittest.TestCase):
     def test_configured_does_not_mean_connected(self):
         self.assertFalse(wa.connection_payload({'status':'active'},self.org)['ready'])
         self.assertFalse(wa.connection_payload({'meta_verified_at':self.now},self.org)['ready'])
-        self.assertTrue(wa.connection_payload({'meta_verified_at':self.now,'webhook_verified_at':self.now},self.org)['ready'])
+        configured={'phone_number_id':'12345','waba_id':'67890','access_token_enc':'x','app_secret_enc':'y'}
+        self.assertTrue(wa.connection_payload({**configured,'meta_verified_at':self.now,'webhook_verified_at':self.now},self.org)['ready'])
     def test_connection_setup_checklist_is_explicit(self):
         with patch.dict('os.environ',{'PULSEFLOW_ENCRYPTION_KEY':'test-only-key-not-for-production-12345'}):
-            value=wa.connection_payload({'meta_verified_at':self.now},self.org)
+            value=wa.connection_payload({'phone_number_id':'12345','waba_id':'67890','access_token_enc':'x','app_secret_enc':'y','meta_verified_at':self.now},self.org)
         self.assertEqual(value['setup'],{'server_ready':True,'credentials_saved':True,
             'meta_verified':True,'webhook_verified':False,'messages_subscribed':False})
+    def test_prepared_webhook_is_not_reported_as_credentials(self):
+        value=wa.connection_payload({'verify_token_hash':'secret','webhook_verified_at':self.now},self.org)
+        self.assertFalse(value['configured']);self.assertTrue(value['webhook_prepared']);self.assertFalse(value['ready'])
     def test_connection_hides_credentials(self):
         value=wa.connection_payload({'access_token_enc':'secret','verify_token_hash':'secret'},self.org)
         self.assertNotIn('secret',json.dumps(value,default=str))
