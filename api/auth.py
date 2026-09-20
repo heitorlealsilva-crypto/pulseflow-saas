@@ -339,6 +339,18 @@ class handler(BaseHTTPRequestHandler):
                     audits = db.execute("SELECT a.id,a.action,a.metadata,a.created_at,a.organization_id,o.name AS organization_name,u.name AS actor_name FROM audit_logs a LEFT JOIN organizations o ON o.id=a.organization_id LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100").fetchall()
                     return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "audits": audits,
                                            "summary": {"accounts": len(accounts), "users": len(users), "active": sum(item["status"] == "active" for item in users)}})
+                if action == "team":
+                    organization_id = self.allowed_organization(user, self.requested_organization())
+                    if not organization_id:
+                        raise RequestError("conta não autorizada", 403)
+                    if user["role"] not in ("owner", "super_admin"):
+                        raise RequestError("somente o proprietário pode gerenciar a equipe", 403)
+                    account = self.account(db, organization_id)
+                    require_permission(user, account, "manage_settings")
+                    members = db.execute("""SELECT id,name,email,role,status,last_login_at,created_at
+                        FROM users WHERE organization_id=%s ORDER BY role='owner' DESC,created_at""", (organization_id,)).fetchall()
+                    return self.reply(200, {"ok": True, "members": members,
+                        "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
                 if action == "workspace":
                     organization_id = self.allowed_organization(user, self.requested_organization())
                     if not organization_id:
@@ -377,6 +389,10 @@ class handler(BaseHTTPRequestHandler):
                     raise RequestError("não autenticado", 401)
                 if action == "workspace":
                     return self.save_workspace(db, user, payload)
+                if action == "team-user":
+                    return self.manage_team_user(db, user, payload)
+                if action == "change-password":
+                    return self.change_password(db, user, payload)
                 if action in ("admin-account", "admin-user"):
                     if user["role"] != "super_admin":
                         raise RequestError("acesso restrito", 403)
@@ -499,6 +515,71 @@ class handler(BaseHTTPRequestHandler):
         self.audit(db, user, target["organization_id"], f"admin.user.{status}", {"user_id": user_id})
         db.commit()
         return self.reply(200, {"ok": True, "user_id": user_id, "status": status})
+
+    def manage_team_user(self, db, user, payload):
+        organization_id = self.allowed_organization(user, str(payload.get("organization_id", "")))
+        if not organization_id:
+            raise RequestError("conta não autorizada", 403)
+        if user["role"] not in ("owner", "super_admin"):
+            raise RequestError("somente o proprietário pode gerenciar a equipe", 403)
+        account = self.account(db, organization_id, locked=True)
+        require_permission(user, account, "manage_settings")
+        operation = payload.get("operation")
+        if operation == "create":
+            if account["plan"] != "Equipe":
+                raise RequestError("adicione usuários somente no plano Equipe", 403)
+            active = db.execute("SELECT COUNT(*)::int AS count FROM users WHERE organization_id=%s AND status='active'", (organization_id,)).fetchone()["count"]
+            if active >= 3:
+                raise RequestError("o plano Equipe permite até 3 usuários ativos", 409)
+            name, email, password = payload.get("name"), payload.get("email"), payload.get("password")
+            if not isinstance(name, str) or not name.strip() or len(name) > 160:
+                raise RequestError("informe o nome do usuário")
+            if not isinstance(email, str) or len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email.strip().lower()):
+                raise RequestError("informe um e-mail válido")
+            if not isinstance(password, str) or not 10 <= len(password) <= 1024:
+                raise RequestError("a senha inicial precisa ter pelo menos 10 caracteres")
+            member_id, email = uuid.uuid4(), email.strip().lower()
+            db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'member')",
+                       (member_id, organization_id, name.strip(), email, password_hash(password)))
+            self.audit(db, user, organization_id, "team.user.created", {"user_id": str(member_id), "email": email})
+            db.commit()
+            return self.reply(200, {"ok": True, "user_id": member_id, "status": "active"})
+        if operation == "status":
+            member_id, status = organization_uuid(payload.get("user_id")), payload.get("status")
+            if status not in ("active", "suspended"):
+                raise RequestError("status inválido")
+            target = db.execute("SELECT id,role,status FROM users WHERE id=%s AND organization_id=%s FOR UPDATE", (member_id, organization_id)).fetchone()
+            if not target:
+                raise RequestError("usuário não encontrado", 404)
+            if target["role"] != "member":
+                raise RequestError("o proprietário não pode ser alterado por esta ação", 403)
+            if status == "active" and target["status"] != "active":
+                active = db.execute("SELECT COUNT(*)::int AS count FROM users WHERE organization_id=%s AND status='active'", (organization_id,)).fetchone()["count"]
+                if account["plan"] != "Equipe" or active >= 3:
+                    raise RequestError("o plano atual não permite reativar este usuário", 409)
+            db.execute("UPDATE users SET status=%s WHERE id=%s", (status, member_id))
+            if status == "suspended":
+                db.execute("DELETE FROM sessions WHERE user_id=%s", (member_id,))
+            self.audit(db, user, organization_id, f"team.user.{status}", {"user_id": member_id})
+            db.commit()
+            return self.reply(200, {"ok": True, "user_id": member_id, "status": status})
+        raise RequestError("operação de equipe inválida")
+
+    def change_password(self, db, user, payload):
+        current, new = payload.get("current_password"), payload.get("new_password")
+        if not isinstance(current, str) or not isinstance(new, str) or not 10 <= len(new) <= 1024:
+            raise RequestError("a nova senha precisa ter pelo menos 10 caracteres")
+        locked = db.execute("SELECT id,password_hash FROM users WHERE id=%s FOR UPDATE", (user["id"],)).fetchone()
+        if not locked or not password_valid(current, locked["password_hash"]):
+            raise RequestError("senha atual incorreta", 401)
+        if password_valid(new, locked["password_hash"]):
+            raise RequestError("escolha uma senha diferente da atual")
+        db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (password_hash(new), user["id"]))
+        token = self.session_token()
+        db.execute("DELETE FROM sessions WHERE user_id=%s AND token_hash<>%s", (user["id"], hashlib.sha256(token.encode()).hexdigest()))
+        self.audit(db, user, user.get("organization_id"), "user.password.changed")
+        db.commit()
+        return self.reply(200, {"ok": True})
 
     def _create_session(self, db, user_id):
         token = secrets.token_urlsafe(32)

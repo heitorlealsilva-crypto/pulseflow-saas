@@ -9,6 +9,8 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Contatos, pipelines, notas, próximos contatos, registro manual de ligações, valores comerciais e roteiros por nicho.
 - Salvamento com revisão: quando duas sessões alteram a mesma conta, uma versão antiga não pode sobrescrever silenciosamente a mais recente.
 - Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. Ações administrativas são auditadas.
+- Gestão de equipe pelo proprietário: o plano Base é individual e o plano Equipe permite até três usuários ativos no mesmo espaço, com suspensão imediata de sessões e troca de senha.
+- Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
 - Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
 - Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
 
@@ -28,7 +30,7 @@ Os roteiros por nicho e sugestões locais continuam funcionando sem custo de mod
 
 ### Planos e serviços externos
 
-Os valores de referência são **Base: R$ 9,90/mês** e **Equipe: R$ 29,90/mês**. A cobrança, assinatura e cancelamento automático por um processador de pagamento não estão integrados. A alteração de plano pelo administrador é operacional; não efetua uma cobrança.
+Os valores de referência são **Base: R$ 9,90/mês** para uma pessoa e **Equipe: R$ 29,90/mês** para até três usuários ativos. A cobrança, assinatura e cancelamento automático por um processador de pagamento não estão integrados. A alteração de plano pelo administrador é operacional; não efetua uma cobrança.
 
 O consumo do WhatsApp oficial pertence à conta Meta do cliente. O PulseFlow não acrescenta uma mensalidade de API. Google Agenda, VoIP e outros CRMs ainda precisam de conectores e autorizações próprios; registrar manualmente uma reunião ou ligação não ativa essas integrações.
 

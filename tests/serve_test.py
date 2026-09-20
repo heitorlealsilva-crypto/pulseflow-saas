@@ -219,6 +219,12 @@ class Handler(StaticHandler):
                 return self.fail(401, "não autenticado")
             if self.command == "GET" and action == "me":
                 return self.reply(200, {"ok": True, "user": public_user(user), "account": STORE["accounts"].get(user["organization_id"])})
+            if self.command == "GET" and action == "team":
+                account = self.requested_account(user, query.get("organization_id"))
+                if not account or user["role"] not in ("owner", "super_admin"):
+                    return self.fail(403, "somente o proprietário pode gerenciar a equipe")
+                members = [public_user(item) | {"last_login_at": item.get("last_login_at"), "created_at": item.get("created_at")} for item in STORE["users"].values() if item["organization_id"] == account["id"]]
+                return self.reply(200, {"ok": True, "members": members, "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
             if action == "workspace":
                 account = self.requested_account(user, query.get("organization_id") if self.command == "GET" else payload.get("organization_id"))
                 if not account:
@@ -241,6 +247,41 @@ class Handler(StaticHandler):
                 if user["role"] == "super_admin":
                     self.audit(user, account, "support.workspace.updated")
                 return self.reply(200, {"ok": True, "account": account, "revision": updated["revision"], "updated_at": updated["updated_at"]})
+            if self.command == "POST" and action == "team-user":
+                account = self.requested_account(user, payload.get("organization_id"))
+                if not account or user["role"] not in ("owner", "super_admin"):
+                    return self.fail(403, "somente o proprietário pode gerenciar a equipe")
+                if payload.get("operation") == "create":
+                    if account["plan"] != "Equipe":
+                        return self.fail(403, "adicione usuários somente no plano Equipe")
+                    if sum(item["organization_id"] == account["id"] and item["status"] == "active" for item in STORE["users"].values()) >= 3:
+                        return self.fail(409, "o plano Equipe permite até 3 usuários ativos")
+                    name, email, password = str(payload.get("name", "")).strip(), str(payload.get("email", "")).strip().lower(), str(payload.get("password", ""))
+                    if not name or "@" not in email or len(password) < 10:
+                        return self.fail(400, "nome, e-mail e senha inicial são obrigatórios")
+                    if any(item["email"] == email for item in STORE["users"].values()):
+                        return self.fail(409, "e-mail já cadastrado")
+                    member_id = identifier(); STORE["users"][member_id] = {"id": member_id, "name": name, "email": email, "role": "member", "status": "active", "organization_id": account["id"], "password_hash": password_digest(password), "created_at": now(), "last_login_at": None}
+                    self.audit(user, account, "team.user.created")
+                    return self.reply(200, {"ok": True, "user_id": member_id, "status": "active"})
+                if payload.get("operation") == "status":
+                    target = STORE["users"].get(payload.get("user_id")); status = payload.get("status")
+                    if not target or target["organization_id"] != account["id"]:
+                        return self.fail(404, "usuário não encontrado")
+                    if target["role"] != "member" or status not in ("active", "suspended"):
+                        return self.fail(403, "alteração não permitida")
+                    target["status"] = status
+                    if status == "suspended":
+                        STORE["sessions"] = {key: value for key, value in STORE["sessions"].items() if value != target["id"]}
+                    self.audit(user, account, "team.user." + status)
+                    return self.reply(200, {"ok": True, "user_id": target["id"], "status": status})
+                return self.fail(400, "operação de equipe inválida")
+            if self.command == "POST" and action == "change-password":
+                current, new = str(payload.get("current_password", "")), str(payload.get("new_password", ""))
+                if len(new) < 10 or not secrets.compare_digest(user["password_hash"], password_digest(current)):
+                    return self.fail(400, "senha atual incorreta ou nova senha inválida")
+                user["password_hash"] = password_digest(new)
+                return self.reply(200, {"ok": True})
             if user["role"] != "super_admin":
                 return self.fail(403, "acesso restrito")
             if self.command == "GET" and action == "admin":

@@ -18,10 +18,16 @@ async function call(action,payload,cookie=''){const r=await fetch(origin+'/api/a
  assert.equal((await call('workspace',{organization_id:other,revision:0,state},a.cookie)).status,403);
  const untouched=await call('workspace&organization_id='+other,undefined,b.cookie);assert.equal(untouched.data.revision,0);
  const admin=await call('login',{email:'admin@example.test',password:'PulseFlow-local-2026!'});assert.equal(admin.status,200);
+ assert.equal((await call('admin-account',{organization_id:org,plan:'Equipe'},admin.cookie)).status,200);
+ const team=await call('team&organization_id='+org,undefined,a.cookie);assert.equal(team.status,200);assert.equal(team.data.members.length,1);assert.equal(team.data.limit,3);
+ const teammateEmail='member'+nonce+'@example.test',teammatePassword='Member-only-Password!';const created=await call('team-user',{organization_id:org,operation:'create',name:'Vendedor B',email:teammateEmail,password:teammatePassword},a.cookie);assert.equal(created.status,200);
+ const teammate=await call('login',{email:teammateEmail,password:teammatePassword});assert.equal(teammate.status,200);assert.equal(teammate.data.user.organization_id,org);assert.equal((await call('team&organization_id='+org,undefined,teammate.cookie)).status,403);
+ assert.equal((await call('team-user',{organization_id:org,operation:'status',user_id:created.data.user_id,status:'suspended'},a.cookie)).status,200);assert.equal((await call('me',undefined,teammate.cookie)).status,401);
+ const changedPassword='Changed-owner-Password!';assert.equal((await call('change-password',{current_password:password,new_password:changedPassword},a.cookie)).status,200);assert.equal((await call('login',{email:a.data.user.email,password})).status,401);assert.equal((await call('login',{email:a.data.user.email,password:changedPassword})).status,200);
  assert.equal((await call('admin-account',{organization_id:org,permissions:{workspace_write:false}},admin.cookie)).status,200);
  assert.equal((await call('workspace',{organization_id:org,revision:1,state},a.cookie)).status,403);
  assert.equal((await call('admin-account',{organization_id:org,status:'suspended'},admin.cookie)).status,200);
  assert.equal((await call('me',undefined,a.cookie)).status,401);
  assert.equal((await call('workspace&organization_id='+org,undefined,admin.cookie)).status,200);
- console.log('PASS: isolated HTTP contracts: sessions, tenants, CAS, permissions, suspension and admin support.');
+ console.log('PASS: isolated HTTP contracts: sessions, tenants, team access, CAS, permissions, suspension and admin support.');
 })().catch(e=>{console.error(e);process.exit(1)});
