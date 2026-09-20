@@ -28,7 +28,7 @@ PERMISSIONS = {name: True for name in (
     "workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage"
 )}
 LOCK = threading.RLock()
-STORE = {"accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": []}
+STORE = {"accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [], "invites": {}}
 
 
 def now():
@@ -215,6 +215,17 @@ class Handler(StaticHandler):
                 if user:
                     STORE["sessions"] = {key: value for key, value in STORE["sessions"].items() if value != user["id"]}
                 return self.reply(200, {"ok": True}, "")
+            if self.command == "POST" and action == "accept-invite":
+                token, password = str(payload.get("token", "")), str(payload.get("password", ""))
+                match = next((item for item in STORE["invites"].values() if item["token_hash"] == password_digest(token) and not item.get("accepted_at")), None)
+                if not match or len(password) < 10:
+                    return self.fail(410, "convite inválido ou expirado")
+                account = STORE["accounts"].get(match["organization_id"])
+                if not account or account["plan"] != "Equipe" or sum(item["organization_id"] == account["id"] and item["status"] == "active" for item in STORE["users"].values()) >= 3:
+                    return self.fail(409, "a conta atingiu o limite de usuários")
+                user_id = identifier(); new_user = {"id": user_id, "name": match["name"], "email": match["email"], "role": "member", "status": "active", "organization_id": account["id"], "password_hash": password_digest(password), "created_at": now(), "last_login_at": None}
+                STORE["users"][user_id] = new_user; match["accepted_at"] = now(); self.audit(new_user, account, "team.invite.accepted")
+                return self.session(new_user)
             if not user:
                 return self.fail(401, "não autenticado")
             if self.command == "GET" and action == "me":
@@ -224,7 +235,8 @@ class Handler(StaticHandler):
                 if not account or not self.allowed(user, account, "workspace_read"):
                     return self.fail(403, "conta não autorizada")
                 members = [public_user(item) | {"last_login_at": item.get("last_login_at"), "created_at": item.get("created_at")} for item in STORE["users"].values() if item["organization_id"] == account["id"]]
-                return self.reply(200, {"ok": True, "members": members, "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
+                invites = [{key: item[key] for key in ("id", "name", "email", "expires_at", "created_at")} for item in STORE["invites"].values() if item["organization_id"] == account["id"] and not item.get("accepted_at")]
+                return self.reply(200, {"ok": True, "members": members, "invites": invites, "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
             if action == "workspace":
                 account = self.requested_account(user, query.get("organization_id") if self.command == "GET" else payload.get("organization_id"))
                 if not account:
@@ -276,6 +288,28 @@ class Handler(StaticHandler):
                     self.audit(user, account, "team.user." + status)
                     return self.reply(200, {"ok": True, "user_id": target["id"], "status": status})
                 return self.fail(400, "operação de equipe inválida")
+            if self.command == "POST" and action == "team-invite":
+                account = self.requested_account(user, payload.get("organization_id"))
+                if not account or user["role"] not in ("owner", "super_admin"):
+                    return self.fail(403, "somente o proprietário pode convidar a equipe")
+                if payload.get("operation") == "cancel":
+                    invite = STORE["invites"].get(payload.get("invite_id"))
+                    if not invite or invite["organization_id"] != account["id"] or invite.get("accepted_at"):
+                        return self.fail(404, "convite não encontrado")
+                    del STORE["invites"][invite["id"]]; self.audit(user, account, "team.invite.cancelled")
+                    return self.reply(200, {"ok": True})
+                if payload.get("operation") != "create" or account["plan"] != "Equipe":
+                    return self.fail(403, "convites de equipe estão disponíveis no plano Equipe")
+                name, email = str(payload.get("name", "")).strip(), str(payload.get("email", "")).strip().lower()
+                if not name or "@" not in email or any(item["email"] == email for item in STORE["users"].values()):
+                    return self.fail(400, "nome e e-mail válidos são obrigatórios")
+                active = sum(item["organization_id"] == account["id"] and item["status"] == "active" for item in STORE["users"].values())
+                pending = sum(item["organization_id"] == account["id"] and not item.get("accepted_at") for item in STORE["invites"].values())
+                if active + pending >= 3:
+                    return self.fail(409, "o plano Equipe permite até 3 usuários ou convites ativos")
+                token, invite_id = secrets.token_urlsafe(32), identifier(); STORE["invites"][invite_id] = {"id": invite_id, "organization_id": account["id"], "name": name, "email": email, "token_hash": password_digest(token), "expires_at": now(), "created_at": now(), "accepted_at": None}
+                self.audit(user, account, "team.invite.created")
+                return self.reply(200, {"ok": True, "invite_id": invite_id, "invite_path": "/#invite=" + token, "expires_in_hours": 48})
             if self.command == "POST" and action == "change-password":
                 current, new = str(payload.get("current_password", "")), str(payload.get("new_password", ""))
                 if len(new) < 10 or not secrets.compare_digest(user["password_hash"], password_digest(current)):

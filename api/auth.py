@@ -94,6 +94,12 @@ def ensure_schema(db):
             expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
     """, "CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)",
         "CREATE INDEX IF NOT EXISTS users_org_idx ON users(organization_id)", """
+        CREATE TABLE IF NOT EXISTS team_invites (
+            id UUID PRIMARY KEY, organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+            invited_by UUID REFERENCES users(id) ON DELETE SET NULL, name TEXT NOT NULL, email TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, accepted_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "CREATE INDEX IF NOT EXISTS team_invites_org_idx ON team_invites(organization_id, expires_at DESC)", """
         CREATE TABLE IF NOT EXISTS tenant_workspaces (
             organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
             state JSONB NOT NULL DEFAULT '{}'::jsonb, revision BIGINT NOT NULL DEFAULT 0,
@@ -347,8 +353,10 @@ class handler(BaseHTTPRequestHandler):
                     require_permission(user, account, "workspace_read")
                     members = db.execute("""SELECT id,name,email,role,status,last_login_at,created_at
                         FROM users WHERE organization_id=%s ORDER BY role='owner' DESC,created_at""", (organization_id,)).fetchall()
+                    invites = db.execute("""SELECT id,name,email,expires_at,created_at FROM team_invites
+                        WHERE organization_id=%s AND accepted_at IS NULL AND expires_at>NOW() ORDER BY created_at DESC""", (organization_id,)).fetchall()
                     return self.reply(200, {"ok": True, "members": members,
-                        "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
+                        "invites": invites, "limit": 3 if account["plan"] == "Equipe" else 1, "plan": account["plan"]})
                 if action == "workspace":
                     organization_id = self.allowed_organization(user, self.requested_organization())
                     if not organization_id:
@@ -376,6 +384,8 @@ class handler(BaseHTTPRequestHandler):
                 action = self.action()
                 if action in ("register", "login"):
                     return self.authenticate(db, action, payload)
+                if action == "accept-invite":
+                    return self.accept_invite(db, payload)
                 if action == "logout":
                     token = self.session_token()
                     if token:
@@ -389,6 +399,8 @@ class handler(BaseHTTPRequestHandler):
                     return self.save_workspace(db, user, payload)
                 if action == "team-user":
                     return self.manage_team_user(db, user, payload)
+                if action == "team-invite":
+                    return self.manage_team_invite(db, user, payload)
                 if action == "change-password":
                     return self.change_password(db, user, payload)
                 if action in ("admin-account", "admin-user"):
@@ -562,6 +574,72 @@ class handler(BaseHTTPRequestHandler):
             db.commit()
             return self.reply(200, {"ok": True, "user_id": member_id, "status": status})
         raise RequestError("operação de equipe inválida")
+
+    def manage_team_invite(self, db, user, payload):
+        organization_id = self.allowed_organization(user, str(payload.get("organization_id", "")))
+        if not organization_id or user["role"] not in ("owner", "super_admin"):
+            raise RequestError("somente o proprietário pode convidar a equipe", 403)
+        account = self.account(db, organization_id, locked=True)
+        require_permission(user, account, "manage_settings")
+        operation = payload.get("operation")
+        if operation == "cancel":
+            invite_id = organization_uuid(payload.get("invite_id"))
+            deleted = db.execute("DELETE FROM team_invites WHERE id=%s AND organization_id=%s AND accepted_at IS NULL RETURNING id", (invite_id, organization_id)).fetchone()
+            if not deleted:
+                raise RequestError("convite não encontrado", 404)
+            self.audit(db, user, organization_id, "team.invite.cancelled", {"invite_id": invite_id})
+            db.commit()
+            return self.reply(200, {"ok": True})
+        if operation != "create":
+            raise RequestError("operação de convite inválida")
+        if account["plan"] != "Equipe":
+            raise RequestError("convites de equipe estão disponíveis no plano Equipe", 403)
+        name, email = payload.get("name"), payload.get("email")
+        if not isinstance(name, str) or not name.strip() or len(name) > 160:
+            raise RequestError("informe o nome do vendedor")
+        if not isinstance(email, str) or len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email.strip().lower()):
+            raise RequestError("informe um e-mail válido")
+        email = email.strip().lower()
+        if db.execute("SELECT 1 FROM users WHERE email=%s", (email,)).fetchone():
+            raise RequestError("e-mail já cadastrado", 409)
+        db.execute("DELETE FROM team_invites WHERE accepted_at IS NULL AND expires_at<=NOW()")
+        active = db.execute("SELECT COUNT(*)::int AS count FROM users WHERE organization_id=%s AND status='active'", (organization_id,)).fetchone()["count"]
+        pending = db.execute("SELECT COUNT(*)::int AS count FROM team_invites WHERE organization_id=%s AND accepted_at IS NULL AND expires_at>NOW()", (organization_id,)).fetchone()["count"]
+        if active + pending >= 3:
+            raise RequestError("o plano Equipe permite até 3 usuários ou convites ativos", 409)
+        db.execute("DELETE FROM team_invites WHERE organization_id=%s AND email=%s AND accepted_at IS NULL", (organization_id, email))
+        token, invite_id = secrets.token_urlsafe(32), uuid.uuid4()
+        db.execute("""INSERT INTO team_invites(id,organization_id,invited_by,name,email,token_hash,expires_at)
+            VALUES(%s,%s,%s,%s,%s,%s,NOW()+INTERVAL '48 hours')""",
+                   (invite_id, organization_id, user["id"], name.strip(), email, hashlib.sha256(token.encode()).hexdigest()))
+        self.audit(db, user, organization_id, "team.invite.created", {"invite_id": str(invite_id), "email": email})
+        db.commit()
+        return self.reply(200, {"ok": True, "invite_id": invite_id, "invite_path": "/#invite=" + token, "expires_in_hours": 48})
+
+    def accept_invite(self, db, payload):
+        token, password = payload.get("token"), payload.get("password")
+        if not isinstance(token, str) or not 32 <= len(token) <= 256:
+            raise RequestError("convite inválido", 400)
+        if not isinstance(password, str) or not 10 <= len(password) <= 1024:
+            raise RequestError("a senha precisa ter pelo menos 10 caracteres")
+        self.rate_limit(db, "accept-invite")
+        invite = db.execute("""SELECT i.*,o.status AS organization_status,o.plan FROM team_invites i
+            JOIN organizations o ON o.id=i.organization_id WHERE i.token_hash=%s FOR UPDATE""",
+                            (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+        if not invite or invite["accepted_at"] or invite["expires_at"] <= utcnow() or invite["organization_status"] != "active":
+            raise RequestError("convite inválido ou expirado", 410)
+        active = db.execute("SELECT COUNT(*)::int AS count FROM users WHERE organization_id=%s AND status='active'", (invite["organization_id"],)).fetchone()["count"]
+        if invite["plan"] != "Equipe" or active >= 3:
+            raise RequestError("a conta atingiu o limite de usuários", 409)
+        if db.execute("SELECT 1 FROM users WHERE email=%s", (invite["email"],)).fetchone():
+            raise RequestError("este e-mail já possui acesso", 409)
+        user_id = uuid.uuid4()
+        db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'member')",
+                   (user_id, invite["organization_id"], invite["name"], invite["email"], password_hash(password)))
+        db.execute("UPDATE team_invites SET accepted_at=NOW() WHERE id=%s", (invite["id"],))
+        accepted_user = {"id": user_id, "organization_id": invite["organization_id"]}
+        self.audit(db, accepted_user, invite["organization_id"], "team.invite.accepted", {"invite_id": str(invite["id"])})
+        return self._create_session(db, user_id)
 
     def change_password(self, db, user, payload):
         current, new = payload.get("current_password"), payload.get("new_password")
