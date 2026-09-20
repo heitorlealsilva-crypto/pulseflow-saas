@@ -8,7 +8,7 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Contas separadas por empresa. Os dados operacionais são salvos no banco; não dependem de um cadastro fictício no navegador.
 - Contatos, pipelines, notas, próximos contatos, registro manual de ligações, valores comerciais e roteiros por nicho.
 - Salvamento com revisão: quando duas sessões alteram a mesma conta, uma versão antiga não pode sobrescrever silenciosamente a mais recente.
-- Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. Ações administrativas são auditadas.
+- Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. O administrador pode gerar um link de redefinição de senha com 30 minutos de validade e uso único para um usuário ativo; a conclusão encerra as sessões antigas. Ações administrativas são auditadas.
 - Gestão de equipe pelo proprietário: o plano Base é individual e o plano Equipe permite até três usuários ativos no mesmo espaço, com convite único de 48 horas, senha definida pelo próprio vendedor, responsável por contato e suspensão imediata de sessões.
 - Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
 - Termos e Política de Privacidade públicos, com aceite versionado gravado no cadastro e no convite de equipe. Os textos do MVP precisam de identificação completa do operador e revisão jurídica antes da comercialização em escala.

@@ -103,6 +103,12 @@ def ensure_schema(db):
             token_hash TEXT NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, accepted_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
     """, "CREATE INDEX IF NOT EXISTS team_invites_org_idx ON team_invites(organization_id, expires_at DESC)", """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id UUID PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_by UUID REFERENCES users(id) ON DELETE SET NULL, token_hash TEXT NOT NULL UNIQUE,
+            expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "CREATE INDEX IF NOT EXISTS password_reset_user_idx ON password_reset_tokens(user_id, expires_at DESC)", """
         CREATE TABLE IF NOT EXISTS tenant_workspaces (
             organization_id UUID PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
             state JSONB NOT NULL DEFAULT '{}'::jsonb, revision BIGINT NOT NULL DEFAULT 0,
@@ -389,6 +395,8 @@ class handler(BaseHTTPRequestHandler):
                     return self.authenticate(db, action, payload)
                 if action == "accept-invite":
                     return self.accept_invite(db, payload)
+                if action == "accept-password-reset":
+                    return self.accept_password_reset(db, payload)
                 if action == "logout":
                     token = self.session_token()
                     if token:
@@ -410,6 +418,10 @@ class handler(BaseHTTPRequestHandler):
                     if user["role"] != "super_admin":
                         raise RequestError("acesso restrito", 403)
                     return self.update_account(db, user, payload) if action == "admin-account" else self.update_user(db, user, payload)
+                if action == "admin-password-reset":
+                    if user["role"] != "super_admin":
+                        raise RequestError("acesso restrito", 403)
+                    return self.create_password_reset(db, user, payload)
                 raise RequestError("ação não encontrada", 404)
         except RequestError as error:
             return self.reply(error.status, {"ok": False, "error": str(error), **error.details})
@@ -667,6 +679,44 @@ class handler(BaseHTTPRequestHandler):
         self.audit(db, user, user.get("organization_id"), "user.password.changed")
         db.commit()
         return self.reply(200, {"ok": True})
+
+    def create_password_reset(self, db, user, payload):
+        user_id = organization_uuid(payload.get("user_id"))
+        target = db.execute("SELECT id,organization_id,role,email,status FROM users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        if not target:
+            raise RequestError("usuário não encontrado", 404)
+        if target["role"] == "super_admin":
+            raise RequestError("use o procedimento de recuperação do administrador", 403)
+        if target["status"] != "active":
+            raise RequestError("reative o usuário antes de redefinir a senha", 409)
+        db.execute("UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=%s AND used_at IS NULL", (user_id,))
+        token, reset_id = secrets.token_urlsafe(32), uuid.uuid4()
+        db.execute("""INSERT INTO password_reset_tokens(id,user_id,created_by,token_hash,expires_at)
+            VALUES(%s,%s,%s,%s,NOW()+INTERVAL '30 minutes')""",
+                   (reset_id, user_id, user["id"], hashlib.sha256(token.encode()).hexdigest()))
+        self.audit(db, user, target["organization_id"], "admin.password_reset.created", {"user_id": user_id, "reset_id": str(reset_id)})
+        db.commit()
+        return self.reply(200, {"ok": True, "reset_path": "/#reset=" + token, "expires_in_minutes": 30})
+
+    def accept_password_reset(self, db, payload):
+        token, password = payload.get("token"), payload.get("password")
+        if not isinstance(token, str) or not 32 <= len(token) <= 256:
+            raise RequestError("link de recuperação inválido", 400)
+        if not isinstance(password, str) or not 10 <= len(password) <= 1024:
+            raise RequestError("a nova senha precisa ter pelo menos 10 caracteres")
+        self.rate_limit(db, "accept-password-reset")
+        reset = db.execute("""SELECT r.*,u.organization_id,u.role,u.status AS user_status,o.status AS organization_status
+            FROM password_reset_tokens r JOIN users u ON u.id=r.user_id
+            LEFT JOIN organizations o ON o.id=u.organization_id
+            WHERE r.token_hash=%s FOR UPDATE""", (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+        if not reset or reset["used_at"] or reset["expires_at"] <= utcnow() or reset["role"] == "super_admin" or reset["user_status"] != "active" or reset["organization_status"] != "active":
+            raise RequestError("link de recuperação inválido ou expirado", 410)
+        db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (password_hash(password), reset["user_id"]))
+        db.execute("UPDATE password_reset_tokens SET used_at=NOW() WHERE id=%s", (reset["id"],))
+        db.execute("DELETE FROM sessions WHERE user_id=%s", (reset["user_id"],))
+        reset_user = {"id": reset["user_id"], "organization_id": reset["organization_id"]}
+        self.audit(db, reset_user, reset["organization_id"], "user.password_reset.completed")
+        return self._create_session(db, reset["user_id"])
 
     def _create_session(self, db, user_id):
         token = secrets.token_urlsafe(32)

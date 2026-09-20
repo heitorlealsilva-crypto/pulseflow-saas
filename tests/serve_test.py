@@ -15,7 +15,7 @@ import secrets
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -29,7 +29,10 @@ PERMISSIONS = {name: True for name in (
 )}
 LEGAL_VERSION = "2026-09-20"
 LOCK = threading.RLock()
-STORE = {"accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [], "invites": {}}
+STORE = {
+    "accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [],
+    "invites": {}, "password_resets": {},
+}
 
 
 def now():
@@ -232,6 +235,27 @@ class Handler(StaticHandler):
                 user_id = identifier(); new_user = {"id": user_id, "name": match["name"], "email": match["email"], "role": "member", "status": "active", "organization_id": account["id"], "password_hash": password_digest(password), "legal_version": LEGAL_VERSION, "legal_accepted_at": now(), "created_at": now(), "last_login_at": None}
                 STORE["users"][user_id] = new_user; match["accepted_at"] = now(); self.audit(new_user, account, "team.invite.accepted")
                 return self.session(new_user)
+            if self.command == "POST" and action == "accept-password-reset":
+                token, password = str(payload.get("token", "")), str(payload.get("password", ""))
+                if not 32 <= len(token) <= 256:
+                    return self.fail(400, "link de recuperação inválido")
+                if len(password) < 10:
+                    return self.fail(400, "a nova senha precisa ter pelo menos 10 caracteres")
+                token_hash = password_digest(token)
+                reset = next((item for item in STORE["password_resets"].values() if item["token_hash"] == token_hash), None)
+                target = STORE["users"].get(reset["user_id"]) if reset else None
+                account = STORE["accounts"].get(target["organization_id"]) if target else None
+                if (
+                    not reset or reset.get("used_at") or reset["expires_at"] <= datetime.now(timezone.utc)
+                    or not target or target["role"] == "super_admin" or target["status"] != "active"
+                    or not account or account["status"] != "active"
+                ):
+                    return self.fail(410, "link de recuperação inválido ou expirado")
+                target["password_hash"] = password_digest(password)
+                reset["used_at"] = now()
+                STORE["sessions"] = {key: value for key, value in STORE["sessions"].items() if value != target["id"]}
+                self.audit(target, account, "user.password_reset.completed")
+                return self.session(target)
             if not user:
                 return self.fail(401, "não autenticado")
             if self.command == "GET" and action == "me":
@@ -324,6 +348,27 @@ class Handler(StaticHandler):
                 return self.reply(200, {"ok": True})
             if user["role"] != "super_admin":
                 return self.fail(403, "acesso restrito")
+            if self.command == "POST" and action == "admin-password-reset":
+                target = STORE["users"].get(payload.get("user_id"))
+                if not target:
+                    return self.fail(404, "usuário não encontrado")
+                if target["role"] == "super_admin":
+                    return self.fail(403, "use o procedimento de recuperação do administrador")
+                account = STORE["accounts"].get(target["organization_id"])
+                if target["status"] != "active" or not account or account["status"] != "active":
+                    return self.fail(409, "reative o usuário e a conta antes de redefinir a senha")
+                for previous in STORE["password_resets"].values():
+                    if previous["user_id"] == target["id"] and not previous.get("used_at"):
+                        previous["used_at"] = now()
+                token, reset_id = secrets.token_urlsafe(32), identifier()
+                STORE["password_resets"][reset_id] = {
+                    "id": reset_id, "user_id": target["id"], "created_by": user["id"],
+                    "token_hash": password_digest(token),
+                    "expires_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+                    "used_at": None, "created_at": now(),
+                }
+                self.audit(user, account, "admin.password_reset.created")
+                return self.reply(200, {"ok": True, "reset_path": "/#reset=" + token, "expires_in_minutes": 30})
             if self.command == "GET" and action == "admin":
                 accounts = [{**account, "users_count": sum(item["organization_id"] == account["id"] for item in STORE["users"].values())} for account in STORE["accounts"].values()]
                 users = [{**public_user(item), "organization_name": STORE["accounts"].get(item["organization_id"], {}).get("name")} for item in STORE["users"].values()]
