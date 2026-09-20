@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {freshWorkspace,normalizeWorkspace,defaultCadence,phoneNumber,callRecorded,canContact,nextDue,taskList,suggestions,escapeHTML,isUntouchedLegacySample} from '../core.mjs';
+import {freshWorkspace,normalizeWorkspace,defaultCadence,phoneNumber,callRecorded,canContact,nextDue,taskList,dueReviewActions,suggestions,escapeHTML,isUntouchedLegacySample} from '../core.mjs';
 const now=Date.now(),hour=3600000,day=hour*24;
 const base=()=>({id:'l1',name:'Ana',phone:'11912345678',board:'Principal',stage:'new',entered:now-day,messages:[],calls:[]});
 const called=()=>({...base(),calls:[{id:'c1',at:new Date(now-hour).toISOString(),outcome:'Não atendeu'}],lastContactAt:new Date(now-hour).toISOString()});
@@ -22,3 +22,5 @@ test('inactive recall excludes remarketing and abandoned',()=>{const w=freshWork
 test('waiting completion restarts SLA and zero disables it',()=>{const w=freshWorkspace(),l={...called(),stage:'waiting',lastTaskCompletedAt:now};assert.equal(nextDue(l,w,now).at,now+day);w.columns.find(c=>c.id==='waiting').limit=0;assert.equal(nextDue(l,w,now),null)});
 test('task ordering ignores invalid dates',()=>{const w=freshWorkspace();w.leads=[{...base(),id:'1',nextDate:'bad'},{...base(),id:'2'}];assert.equal(taskList(w).length,1)});
 test('niche and reason contextualize templates',()=>{assert.match(suggestions('Barbearia',base())[0],/corte/);assert.match(suggestions('Serviços',{...base(),discardReason:'orçamento'})[1],/orçamento/);assert.equal(escapeHTML('<img onerror="x">'),'&lt;img onerror=&quot;x&quot;&gt;')});
+test('due cadence becomes a review and never an automatic send',()=>{const w=freshWorkspace(),started=now-3*hour;w.leads=[{id:'l1',name:'Ana Souza',phone:'5511912345678',board:'Principal',stage:'service',entered:started,calls:[{id:'c1',at:new Date(started).toISOString(),outcome:'Não atendeu'}],cadenceEnabled:true,cadenceStarted:started,cadenceIndex:0}];const actions=dueReviewActions(w,now);assert.equal(actions.length,1);assert.equal(actions[0].kind,'cadence');assert.match(actions[0].text,/Ana/);assert.equal(actions[0].dedupeKey.startsWith('cadence:l1:0:'),true);assert.equal(actions[0].status,undefined)});
+test('due first contact asks for a call and contains no message',()=>{const w=freshWorkspace();w.leads=[{id:'l1',name:'Ana',phone:'5511912345678',board:'Principal',stage:'new',entered:now-1000,calls:[]}];const [action]=dueReviewActions(w,now);assert.equal(action.kind,'call');assert.equal(action.text,'');assert.match(action.title,/ligação/)});

@@ -48,6 +48,19 @@ export function nextDue(l,w,now=Date.now()){
  return null;
 }
 export function taskList(w,now=Date.now()){return w.leads.map(lead=>({lead,task:nextDue(lead,w,now)})).filter(x=>x.task&&Number.isFinite(x.task.at)).sort((a,b)=>a.task.at-b.task.at)}
+export function dueReviewActions(w,now=Date.now()){
+ const niche=w.businessProfile?.customNiche||w.businessProfile?.niche||'Serviços';
+ return taskList(w,now).filter(({task})=>task.at<=now).map(({lead,task})=>{
+  const due=Math.floor(task.at/1000),index=Math.max(0,Number(lead.cadenceIndex)||0);
+  let dedupeKey=`task:${lead.id}:${task.type}:${due}`,kind='task',title=task.type,summary=task.reason||'Revise o contexto e conclua a próxima ação.',text='';
+  if(task.reason==='Agendamento'){dedupeKey=`schedule:${lead.id}:${due}`;kind='appointment';title=`${task.type} agendada`;summary='Revise o contexto e conclua a próxima ação.'}
+  else if(lead.board==='Abandonados'){dedupeKey=`recovery:${lead.id}:${due}`;kind='recovery';title='Revisar recuperação';summary=lead.discardReason||summary;text=suggestions(niche,lead)[1]}
+  else if(!callRecorded(lead)){dedupeKey=`call-first:${lead.id}:${due}`;kind='call';title='Primeiro contato por ligação';summary='Registre uma tentativa de ligação antes de preparar qualquer mensagem.'}
+  else if(lead.cadenceEnabled&&task.reason===`Etapa ${index+1}`){const step=w.cadence[index]||{};dedupeKey=`cadence:${lead.id}:${index}:${due}`;kind=task.type==='Ligação'?'call':'cadence';title=`Cadência · etapa ${index+1}`;summary=kind==='call'?'Faça a ligação e registre o resultado.':'Revise a mensagem antes de autorizar o envio.';text=kind==='cadence'?String(step.text||'').replaceAll('{nome}',String(lead.name||'Contato').split(' ')[0]):''}
+  else if(task.type==='Retomar contato'||task.type==='Follow-up'){kind='followup';title=task.type;summary=task.reason||summary;text=suggestions(niche,lead)[1]}
+  return {dedupeKey,leadId:lead.id,leadName:lead.name,kind,title,summary,text,dueAt:new Date(task.at).toISOString()};
+ });
+}
 export function suggestions(niche,l={}){const name=(l.name||'{nome}').split(' ')[0];const topic={'Barbearia':'corte, barba ou os dois','Salão de beleza':'corte, cor ou tratamento','Clínica':'sua avaliação inicial','Loja':'o produto e o prazo que você procura','Imobiliária':'a região, o orçamento e o prazo da busca','Marketing e tráfego':'sua oferta, público e objetivo com os anúncios'}[niche];return [topic?`Oi, ${name}! Posso entender melhor seu interesse em ${topic}?`:`Oi, ${name}! Qual resultado você procura e o que é prioridade agora?`,l.discardReason?`${name}, quando conversamos, você mencionou ${l.discardReason}. Esse cenário mudou ou prefere retomar em outro momento?`:`${name}, ficou alguma dúvida sobre ${l.product||'o que conversamos'}? Posso ajudar a definir o próximo passo.`,`${name}, faz sentido marcarmos uma conversa breve para entender ${l.needs||'o que você precisa'} e avaliar os próximos passos?` ]}
 export function contextualTips(l){const tips=[];if(l.optOut)return ['Este contato pediu para não receber mensagens. Mantenha o acompanhamento pausado.'];if(!l.needs)tips.push('Pergunte: qual resultado você espera alcançar e por que isso importa agora?');if(!callRecorded(l))tips.push('Registre uma tentativa de ligação antes de preparar a primeira mensagem.');if(l.discardReason)tips.push('Confirme se o motivo do descarte ainda se aplica: '+l.discardReason+'.');if(l.product&&!l.contractValue)tips.push('Confirme escopo e expectativas antes de apresentar o investimento.');if(l.notes)tips.push('Use suas notas como contexto. Confirme com o cliente o que ainda estiver em aberto.');tips.push('Antes de sugerir uma reunião, confirme o objetivo, quem participa e a disponibilidade.');return tips.slice(0,4)}
 export function messageData(m){return Array.isArray(m)?{direction:m[0],body:m[1],time:m[2],status:'registro anterior'}:m}
