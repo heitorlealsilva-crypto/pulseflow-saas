@@ -112,6 +112,11 @@ class SecurityTests(unittest.TestCase):
         self.assertFalse(wa.connection_payload({'status':'active'},self.org)['ready'])
         self.assertFalse(wa.connection_payload({'meta_verified_at':self.now},self.org)['ready'])
         self.assertTrue(wa.connection_payload({'meta_verified_at':self.now,'webhook_verified_at':self.now},self.org)['ready'])
+    def test_connection_setup_checklist_is_explicit(self):
+        with patch.dict('os.environ',{'PULSEFLOW_ENCRYPTION_KEY':'test-only-key-not-for-production-12345'}):
+            value=wa.connection_payload({'meta_verified_at':self.now},self.org)
+        self.assertEqual(value['setup'],{'server_ready':True,'credentials_saved':True,
+            'meta_verified':True,'webhook_verified':False,'messages_subscribed':False})
     def test_connection_hides_credentials(self):
         value=wa.connection_payload({'access_token_enc':'secret','verify_token_hash':'secret'},self.org)
         self.assertNotIn('secret',json.dumps(value,default=str))

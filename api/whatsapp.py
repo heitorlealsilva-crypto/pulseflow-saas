@@ -239,12 +239,22 @@ def send_guard(workspace, payload, latest_inbound=None, now=None):
 def connection_payload(row, organization_id):
     public = {key: row.get(key) for key in PUBLIC_CONNECTION_FIELDS} if row else None
     ready = bool(row and row.get("meta_verified_at") and row.get("webhook_verified_at"))
+    encryption_ready = len(os.getenv("PULSEFLOW_ENCRYPTION_KEY", "")) >= 32
+    meta_verified = bool(row and row.get("meta_verified_at"))
+    webhook_verified = bool(row and row.get("webhook_verified_at"))
     if public:
         public["status"] = "ready" if ready else "configured"
     base = os.getenv("PULSEFLOW_APP_URL", DEFAULT_APP_URL).rstrip("/")
     return {"ok": True, "configured": bool(row), "ready": ready, "connected": ready,
-            "encryption_ready": len(os.getenv("PULSEFLOW_ENCRYPTION_KEY", "")) >= 32,
+            "encryption_ready": encryption_ready,
             "connection": public, "groups_supported": False,
+            "setup": {
+                "server_ready": encryption_ready,
+                "credentials_saved": bool(row),
+                "meta_verified": meta_verified,
+                "webhook_verified": webhook_verified,
+                "messages_subscribed": webhook_verified,
+            },
             "webhook_url": f"{base}/api/whatsapp?action=webhook&organization_id={quote(str(organization_id))}"}
 
 
@@ -442,16 +452,21 @@ class handler(BaseHTTPRequestHandler):
              hashlib.sha256(payload["verify_token"].encode()).hexdigest(), version))
         db.commit()
         row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s FOR UPDATE", (organization_id,)).fetchone()
-        warning = None
+        warning, validation_code = None, None
         try:
             validate_meta(db, organization_id, row)
-        except (urllib.error.URLError, ValueError, TimeoutError, IntegrationError):
+        except IntegrationError as error:
+            db.rollback()
+            warning, validation_code = str(error), error.code
+        except (urllib.error.URLError, ValueError, TimeoutError):
             db.rollback()
             warning = "Credenciais salvas. A validação com a Meta ainda está pendente; revise os dados e clique em validar."
+            validation_code = "meta_validation_failed"
         row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
         result = connection_payload(row, organization_id)
         if warning:
             result["warning"] = warning
+            result["validation_code"] = validation_code
         return self.reply(200, result)
 
     def handle_webhook(self, db, organization_id, payload):
