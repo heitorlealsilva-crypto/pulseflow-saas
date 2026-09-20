@@ -1,5 +1,8 @@
 {
   "cleanUrls": true,
+  "crons": [
+    { "path": "/api/worker", "schedule": "0 10 * * *" }
+  ],
   "headers": [
     {
       "source": "/(.*)",

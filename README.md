@@ -16,7 +16,9 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 
 No modo manual, cadastrar um número **não conecta nem espelha o WhatsApp**. O sistema prepara a mensagem, abre a conversa no WhatsApp e mantém o acompanhamento. Abrir o WhatsApp não confirma entrega: o vendedor precisa confirmar o que efetivamente enviou. Uma ligação registrada é obrigatória antes do primeiro contato por mensagem; contatos que pediram para não receber mensagens devem permanecer bloqueados.
 
-Agendamentos, cadências e regras de automação organizam as próximas ações. As regras são avaliadas quando o espaço é aberto e quando chegam eventos compatíveis; esta versão não inclui um trabalhador de fila ou cron de envio contínuo em segundo plano. O agente pode preparar uma sugestão para revisão, mas uma tarefa vencida nunca significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
+Agendamentos, cadências e regras de automação organizam as próximas ações. O backend mantém uma fila persistente e idempotente: o trabalhador encontra ações vencidas e as coloca na caixa **Aguardando sua decisão**. O agente prepara uma sugestão para revisão, mas uma tarefa vencida nunca significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
+
+O projeto inclui um cron diário compatível com a Vercel Hobby. Esse plano não permite execução mais frequente e não garante precisão dentro da hora; cadências em horas precisam da Vercel Pro ou de um agendador externo chamando `POST /api/worker` com o mesmo `CRON_SECRET`. A fila e as chaves de idempotência continuam as mesmas quando a frequência muda.
 
 ### Sugestões e inteligência artificial
 
@@ -51,6 +53,7 @@ Variáveis de ambiente:
 | `PULSEFLOW_ADMIN_PASSWORD` | Senha forte do administrador inicial, fornecida como segredo no servidor. |
 | `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp. Manter backup seguro. |
 | `META_GRAPH_VERSION` | Versão da Graph API adotada pela integração, quando configurada. |
+| `CRON_SECRET` | Segredo com pelo menos 16 caracteres, enviado como `Authorization: Bearer ...` pelo cron ou agendador externo. |
 
 Não colocar senhas, tokens ou URLs privadas do banco no JavaScript, no repositório ou em capturas de tela. Trocar a chave de criptografia sem migrar as credenciais existentes impede que elas sejam decifradas. As variáveis administrativas inicializam o administrador; não são uma tela de alteração de senha para usuários existentes.
 
