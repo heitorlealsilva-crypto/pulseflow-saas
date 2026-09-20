@@ -61,6 +61,17 @@ export function dueReviewActions(w,now=Date.now()){
   return {dedupeKey,leadId:lead.id,leadName:lead.name,kind,title,summary,text,dueAt:new Date(task.at).toISOString()};
  });
 }
+const calendarStamp=value=>new Date(value).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z');
+const calendarText=value=>String(value||'').replace(/\\/g,'\\\\').replace(/\r?\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');
+export function calendarEvent(lead,task,business='PulseFlow'){
+ const start=Number(task?.at),end=start+30*60000;
+ if(!lead||!Number.isFinite(start))return null;
+ const title=`${task.type||'Contato'} · ${lead.name||'Contato'}`,description=[task.reason,lead.product&&`Produto: ${lead.product}`,lead.needs&&`Objetivo: ${lead.needs}`,`Organizado no ${business}`].filter(Boolean).join('\n');
+ const dates=`${calendarStamp(start)}/${calendarStamp(end)}`,query=new URLSearchParams({action:'TEMPLATE',text:title,dates,details:description});
+ const uid=`${String(lead.id||'contato').replace(/[^a-zA-Z0-9-]/g,'')}@pulseflow`;
+ const ics=['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//PulseFlow//Agenda//PT-BR','CALSCALE:GREGORIAN','BEGIN:VEVENT',`UID:${calendarText(uid)}`,`DTSTAMP:${calendarStamp(Date.now())}`,`DTSTART:${calendarStamp(start)}`,`DTEND:${calendarStamp(end)}`,`SUMMARY:${calendarText(title)}`,`DESCRIPTION:${calendarText(description)}`,'END:VEVENT','END:VCALENDAR',''].join('\r\n');
+ return {title,url:`https://calendar.google.com/calendar/render?${query}`,ics};
+}
 export function suggestions(niche,l={}){const name=(l.name||'{nome}').split(' ')[0];const topic={'Barbearia':'corte, barba ou os dois','Salão de beleza':'corte, cor ou tratamento','Clínica':'sua avaliação inicial','Loja':'o produto e o prazo que você procura','Imobiliária':'a região, o orçamento e o prazo da busca','Marketing e tráfego':'sua oferta, público e objetivo com os anúncios'}[niche];return [topic?`Oi, ${name}! Posso entender melhor seu interesse em ${topic}?`:`Oi, ${name}! Qual resultado você procura e o que é prioridade agora?`,l.discardReason?`${name}, quando conversamos, você mencionou ${l.discardReason}. Esse cenário mudou ou prefere retomar em outro momento?`:`${name}, ficou alguma dúvida sobre ${l.product||'o que conversamos'}? Posso ajudar a definir o próximo passo.`,`${name}, faz sentido marcarmos uma conversa breve para entender ${l.needs||'o que você precisa'} e avaliar os próximos passos?` ]}
 export function contextualTips(l){const tips=[];if(l.optOut)return ['Este contato pediu para não receber mensagens. Mantenha o acompanhamento pausado.'];if(!l.needs)tips.push('Pergunte: qual resultado você espera alcançar e por que isso importa agora?');if(!callRecorded(l))tips.push('Registre uma tentativa de ligação antes de preparar a primeira mensagem.');if(l.discardReason)tips.push('Confirme se o motivo do descarte ainda se aplica: '+l.discardReason+'.');if(l.product&&!l.contractValue)tips.push('Confirme escopo e expectativas antes de apresentar o investimento.');if(l.notes)tips.push('Use suas notas como contexto. Confirme com o cliente o que ainda estiver em aberto.');tips.push('Antes de sugerir uma reunião, confirme o objetivo, quem participa e a disponibilidade.');return tips.slice(0,4)}
 export function messageData(m){return Array.isArray(m)?{direction:m[0],body:m[1],time:m[2],status:'registro anterior'}:m}
