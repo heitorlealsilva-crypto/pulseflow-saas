@@ -100,6 +100,13 @@ class SecurityTests(unittest.TestCase):
         self.handler.account=lambda *a,**k:auth.public_account({'id':self.org,'status':'active','permissions':{}})
         for value in [{'status':'deleted'},{'plan':'FreeEverything'},{'permissions':{'workspace_read':'yes'}}]:
             with self.assertRaises(auth.RequestError):self.handler.update_account(MagicMock(),self.owner,{'organization_id':self.org,**value})
+    def test_password_reset_locks_only_the_token_row(self):
+        db=MagicMock();db.execute.return_value.fetchone.return_value=None
+        self.handler.rate_limit=lambda *a,**k:None
+        with self.assertRaises(auth.RequestError) as caught:
+            self.handler.accept_password_reset(db,{'token':'x'*43,'password':'New-password-2026!'})
+        self.assertEqual(caught.exception.status,410)
+        self.assertIn('FOR UPDATE OF r',db.execute.call_args.args[0])
     def test_whatsapp_tenant_boundary(self):
         self.assertEqual(wa.allowed_org(self.owner,''),self.org)
         self.assertIsNone(wa.allowed_org(self.owner,self.other))

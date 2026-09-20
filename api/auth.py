@@ -708,7 +708,7 @@ class handler(BaseHTTPRequestHandler):
         reset = db.execute("""SELECT r.*,u.organization_id,u.role,u.status AS user_status,o.status AS organization_status
             FROM password_reset_tokens r JOIN users u ON u.id=r.user_id
             LEFT JOIN organizations o ON o.id=u.organization_id
-            WHERE r.token_hash=%s FOR UPDATE""", (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+            WHERE r.token_hash=%s FOR UPDATE OF r""", (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
         if not reset or reset["used_at"] or reset["expires_at"] <= utcnow() or reset["role"] == "super_admin" or reset["user_status"] != "active" or reset["organization_status"] != "active":
             raise RequestError("link de recuperação inválido ou expirado", 410)
         db.execute("UPDATE users SET password_hash=%s WHERE id=%s", (password_hash(password), reset["user_id"]))
