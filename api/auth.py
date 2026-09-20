@@ -18,6 +18,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 MAX_BODY_BYTES = 2_000_000
+LEGAL_VERSION = "2026-09-20"
 PERMISSIONS = ("workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage")
 WORKSPACE_TYPES = {
     "leads": list, "columns": list, "postSaleColumns": list, "cadence": list,
@@ -87,8 +88,10 @@ def ensure_schema(db):
             id UUID PRIMARY KEY, organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
             name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'owner', status TEXT NOT NULL DEFAULT 'active',
+            legal_version TEXT, legal_accepted_at TIMESTAMPTZ,
             last_login_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
-    """, """
+    """, "ALTER TABLE users ADD COLUMN IF NOT EXISTS legal_version TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS legal_accepted_at TIMESTAMPTZ", """
         CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
@@ -429,13 +432,17 @@ class handler(BaseHTTPRequestHandler):
                 raise RequestError("informe um e-mail válido")
             if len(password) < 8:
                 raise RequestError("a senha precisa ter pelo menos 8 caracteres")
+            if payload.get("legal_accepted") is not True or payload.get("legal_version") != LEGAL_VERSION:
+                raise RequestError("aceite os Termos de Uso e a Política de Privacidade")
             if db.execute("SELECT 1 FROM users WHERE email=%s", (email,)).fetchone():
                 raise RequestError("e-mail já cadastrado", 409)
             org_id, user_id = uuid.uuid4(), uuid.uuid4()
             db.execute("INSERT INTO organizations(id,name,niche,whatsapp) VALUES(%s,%s,%s,%s)",
                        (org_id, company.strip(), str(payload.get("niche", ""))[:160], str(payload.get("whatsapp", ""))[:32]))
-            db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'owner')",
-                       (user_id, org_id, name.strip(), email, password_hash(password)))
+            db.execute("""INSERT INTO users(id,organization_id,name,email,password_hash,role,legal_version,legal_accepted_at)
+                VALUES(%s,%s,%s,%s,%s,'owner',%s,NOW())""",
+                       (user_id, org_id, name.strip(), email, password_hash(password), LEGAL_VERSION))
+            self.audit(db, {"id": user_id}, org_id, "legal.accepted", {"version": LEGAL_VERSION, "source": "registration"})
             return self._create_session(db, user_id)
         user = db.execute("SELECT u.* FROM users u LEFT JOIN organizations o ON o.id=u.organization_id WHERE u.email=%s AND u.status='active' AND (u.role='super_admin' OR o.status='active')", (email,)).fetchone()
         encoded = user["password_hash"] if user else "pbkdf2_sha256$210000$00000000000000000000000000000000$" + "0" * 64
@@ -622,6 +629,8 @@ class handler(BaseHTTPRequestHandler):
             raise RequestError("convite inválido", 400)
         if not isinstance(password, str) or not 10 <= len(password) <= 1024:
             raise RequestError("a senha precisa ter pelo menos 10 caracteres")
+        if payload.get("legal_accepted") is not True or payload.get("legal_version") != LEGAL_VERSION:
+            raise RequestError("aceite os Termos de Uso e a Política de Privacidade")
         self.rate_limit(db, "accept-invite")
         invite = db.execute("""SELECT i.*,o.status AS organization_status,o.plan FROM team_invites i
             JOIN organizations o ON o.id=i.organization_id WHERE i.token_hash=%s FOR UPDATE""",
@@ -634,11 +643,13 @@ class handler(BaseHTTPRequestHandler):
         if db.execute("SELECT 1 FROM users WHERE email=%s", (invite["email"],)).fetchone():
             raise RequestError("este e-mail já possui acesso", 409)
         user_id = uuid.uuid4()
-        db.execute("INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES(%s,%s,%s,%s,%s,'member')",
-                   (user_id, invite["organization_id"], invite["name"], invite["email"], password_hash(password)))
+        db.execute("""INSERT INTO users(id,organization_id,name,email,password_hash,role,legal_version,legal_accepted_at)
+            VALUES(%s,%s,%s,%s,%s,'member',%s,NOW())""",
+                   (user_id, invite["organization_id"], invite["name"], invite["email"], password_hash(password), LEGAL_VERSION))
         db.execute("UPDATE team_invites SET accepted_at=NOW() WHERE id=%s", (invite["id"],))
         accepted_user = {"id": user_id, "organization_id": invite["organization_id"]}
         self.audit(db, accepted_user, invite["organization_id"], "team.invite.accepted", {"invite_id": str(invite["id"])})
+        self.audit(db, accepted_user, invite["organization_id"], "legal.accepted", {"version": LEGAL_VERSION, "source": "team_invite"})
         return self._create_session(db, user_id)
 
     def change_password(self, db, user, payload):

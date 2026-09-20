@@ -5,8 +5,9 @@ async function call(action,payload,cookie=''){const r=await fetch(origin+'/api/a
 (async()=>{
  assert.equal((await call('me')).status,401);
  const nonce=Date.now(),password='Fixture-only-Password!';
- const a=await call('register',{name:'Teste A',company:'Tenant A '+nonce,email:'a'+nonce+'@example.test',password});
- const b=await call('register',{name:'Teste B',company:'Tenant B '+nonce,email:'b'+nonce+'@example.test',password});
+ assert.equal((await call('register',{name:'Sem aceite',company:'Inválida',email:'no-legal'+nonce+'@example.test',password})).status,400);
+ const legal={legal_accepted:true,legal_version:'2026-09-20'},a=await call('register',{name:'Teste A',company:'Tenant A '+nonce,email:'a'+nonce+'@example.test',password,...legal});
+ const b=await call('register',{name:'Teste B',company:'Tenant B '+nonce,email:'b'+nonce+'@example.test',password,...legal});
  assert.equal(a.status,200);assert.equal(b.status,200);
  assert.equal((await call('admin',undefined,a.cookie)).status,403);
  const org=a.data.user.organization_id,other=b.data.user.organization_id;
@@ -21,7 +22,7 @@ async function call(action,payload,cookie=''){const r=await fetch(origin+'/api/a
  assert.equal((await call('admin-account',{organization_id:org,plan:'Equipe'},admin.cookie)).status,200);
  const team=await call('team&organization_id='+org,undefined,a.cookie);assert.equal(team.status,200);assert.equal(team.data.members.length,1);assert.equal(team.data.limit,3);
  const teammateEmail='member'+nonce+'@example.test',teammatePassword='Member-only-Password!';const invitation=await call('team-invite',{organization_id:org,operation:'create',name:'Vendedor B',email:teammateEmail},a.cookie);assert.equal(invitation.status,200);assert.match(invitation.data.invite_path,/^\/#invite=/);assert.equal((await call('team&organization_id='+org,undefined,a.cookie)).data.invites.length,1);
- const inviteToken=new URL(origin+invitation.data.invite_path).hash.slice(1).split('=')[1],teammate=await call('accept-invite',{token:inviteToken,password:teammatePassword});assert.equal(teammate.status,200);assert.equal(teammate.data.user.organization_id,org);assert.equal((await call('accept-invite',{token:inviteToken,password:teammatePassword})).status,410);assert.equal((await call('team&organization_id='+org,undefined,teammate.cookie)).status,200);assert.equal((await call('team-invite',{organization_id:org,operation:'create',name:'Inválido',email:'invalid@example.test'},teammate.cookie)).status,403);
+ const inviteToken=new URL(origin+invitation.data.invite_path).hash.slice(1).split('=')[1];assert.equal((await call('accept-invite',{token:inviteToken,password:teammatePassword})).status,400);const teammate=await call('accept-invite',{token:inviteToken,password:teammatePassword,...legal});assert.equal(teammate.status,200);assert.equal(teammate.data.user.organization_id,org);assert.equal((await call('accept-invite',{token:inviteToken,password:teammatePassword,...legal})).status,410);assert.equal((await call('team&organization_id='+org,undefined,teammate.cookie)).status,200);assert.equal((await call('team-invite',{organization_id:org,operation:'create',name:'Inválido',email:'invalid@example.test'},teammate.cookie)).status,403);
  assert.equal((await call('team-user',{organization_id:org,operation:'status',user_id:teammate.data.user.id,status:'suspended'},a.cookie)).status,200);assert.equal((await call('me',undefined,teammate.cookie)).status,401);
  const changedPassword='Changed-owner-Password!';assert.equal((await call('change-password',{current_password:password,new_password:changedPassword},a.cookie)).status,200);assert.equal((await call('login',{email:a.data.user.email,password})).status,401);assert.equal((await call('login',{email:a.data.user.email,password:changedPassword})).status,200);
  assert.equal((await call('admin-account',{organization_id:org,permissions:{workspace_write:false}},admin.cookie)).status,200);

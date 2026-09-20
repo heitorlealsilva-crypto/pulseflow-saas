@@ -27,6 +27,7 @@ from server import Handler as StaticHandler  # noqa: E402
 PERMISSIONS = {name: True for name in (
     "workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage"
 )}
+LEGAL_VERSION = "2026-09-20"
 LOCK = threading.RLock()
 STORE = {"accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [], "invites": {}}
 
@@ -195,12 +196,15 @@ class Handler(StaticHandler):
                 email = payload["email"].strip().lower()
                 if "@" not in email or len(payload["password"]) < 8:
                     return self.fail(400, "e-mail inválido ou senha com menos de 8 caracteres")
+                if payload.get("legal_accepted") is not True or payload.get("legal_version") != LEGAL_VERSION:
+                    return self.fail(400, "aceite os Termos de Uso e a Política de Privacidade")
                 if any(item["email"] == email for item in STORE["users"].values()):
                     return self.fail(409, "e-mail já cadastrado")
                 account_id, user_id = identifier(), identifier()
                 STORE["accounts"][account_id] = {"id": account_id, "name": payload["company"].strip(), "plan": "Base", "status": "active", "permissions": dict(PERMISSIONS), "niche": "", "whatsapp": "", "created_at": now()}
-                user = {"id": user_id, "name": payload["name"].strip(), "email": email, "role": "owner", "status": "active", "organization_id": account_id, "password_hash": password_digest(payload["password"]), "created_at": now(), "last_login_at": None}
+                user = {"id": user_id, "name": payload["name"].strip(), "email": email, "role": "owner", "status": "active", "organization_id": account_id, "password_hash": password_digest(payload["password"]), "legal_version": LEGAL_VERSION, "legal_accepted_at": now(), "created_at": now(), "last_login_at": None}
                 STORE["users"][user_id] = user
+                self.audit(user, STORE["accounts"][account_id], "legal.accepted")
                 return self.session(user)
             if self.command == "POST" and action == "login":
                 email = str(payload.get("email", "")).strip().lower()
@@ -218,12 +222,14 @@ class Handler(StaticHandler):
             if self.command == "POST" and action == "accept-invite":
                 token, password = str(payload.get("token", "")), str(payload.get("password", ""))
                 match = next((item for item in STORE["invites"].values() if item["token_hash"] == password_digest(token) and not item.get("accepted_at")), None)
+                if payload.get("legal_accepted") is not True or payload.get("legal_version") != LEGAL_VERSION:
+                    return self.fail(400, "aceite os Termos de Uso e a Política de Privacidade")
                 if not match or len(password) < 10:
                     return self.fail(410, "convite inválido ou expirado")
                 account = STORE["accounts"].get(match["organization_id"])
                 if not account or account["plan"] != "Equipe" or sum(item["organization_id"] == account["id"] and item["status"] == "active" for item in STORE["users"].values()) >= 3:
                     return self.fail(409, "a conta atingiu o limite de usuários")
-                user_id = identifier(); new_user = {"id": user_id, "name": match["name"], "email": match["email"], "role": "member", "status": "active", "organization_id": account["id"], "password_hash": password_digest(password), "created_at": now(), "last_login_at": None}
+                user_id = identifier(); new_user = {"id": user_id, "name": match["name"], "email": match["email"], "role": "member", "status": "active", "organization_id": account["id"], "password_hash": password_digest(password), "legal_version": LEGAL_VERSION, "legal_accepted_at": now(), "created_at": now(), "last_login_at": None}
                 STORE["users"][user_id] = new_user; match["accepted_at"] = now(); self.audit(new_user, account, "team.invite.accepted")
                 return self.session(new_user)
             if not user:

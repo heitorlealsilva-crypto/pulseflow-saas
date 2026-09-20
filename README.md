@@ -11,6 +11,7 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. Ações administrativas são auditadas.
 - Gestão de equipe pelo proprietário: o plano Base é individual e o plano Equipe permite até três usuários ativos no mesmo espaço, com convite único de 48 horas, senha definida pelo próprio vendedor, responsável por contato e suspensão imediata de sessões.
 - Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
+- Termos e Política de Privacidade públicos, com aceite versionado gravado no cadastro e no convite de equipe. Os textos do MVP precisam de identificação completa do operador e revisão jurídica antes da comercialização em escala.
 - Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
 - Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
 
