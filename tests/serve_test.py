@@ -31,7 +31,8 @@ LEGAL_VERSION = "2026-09-20"
 LOCK = threading.RLock()
 STORE = {
     "accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [],
-    "invites": {}, "password_resets": {},
+    "invites": {}, "password_resets": {}, "integration_keys": {},
+    "integration_requests": {}, "integration_events": [],
 }
 
 
@@ -46,6 +47,49 @@ def identifier():
 def password_digest(value):
     # Local fixture only. Production password handling lives in api/auth.py.
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def normalized_phone(value):
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    if len(digits) in (10, 11):
+        digits = "55" + digits
+    return digits if 8 <= len(digits) <= 15 and not digits.startswith("0") else ""
+
+
+def normalized_uuid(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def contact_payload(value):
+    """Expose operational contact data without leaking server-only structures."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "id": str(value.get("id", ""))[:80],
+        "external_id": str(value.get("integrationExternalId", ""))[:128],
+        "name": str(value.get("name", ""))[:160],
+        "phone": str(value.get("phone", ""))[:20],
+        "email": str(value.get("email", ""))[:254],
+        "source": str(value.get("origin", ""))[:120],
+        "interest": str(value.get("interest", ""))[:40],
+        "tags": copy.deepcopy(value.get("tags", [])) if isinstance(value.get("tags"), list) else [],
+        "notes": str(value.get("notes", ""))[:4000],
+        "board": str(value.get("board", ""))[:40],
+        "stage": str(value.get("stage", ""))[:64],
+        "contract_value": value.get("contractValue", 0),
+        "product": str(value.get("product", ""))[:120],
+        "niche": str(value.get("niche", ""))[:120],
+        "revenue": value.get("revenue", 0),
+        "discard_reason": str(value.get("discardReason", ""))[:500],
+        "recovery_at": value.get("recoveryAt"),
+        "consent_confirmed": value.get("consentConfirmed") is True,
+        "opt_out": bool(value.get("optOut") or value.get("opt_out") or value.get("doNotContact")),
+        "automation_paused": value.get("automationPaused") is True,
+        "updated_at": value.get("integrationUpdatedAt"),
+    }
 
 
 def seed():
@@ -122,6 +166,223 @@ class Handler(StaticHandler):
         STORE["audits"].insert(0, {"action": action, "created_at": now(), "actor_name": user["name"], "organization_name": account["name"]})
         del STORE["audits"][100:]
 
+    def integration_key(self, required_scope):
+        authorization = str(self.headers.get("Authorization", ""))
+        if not authorization.startswith("Bearer "):
+            return None, None
+        secret = authorization[7:].strip()
+        if not secret.startswith("pfk_") or len(secret) > 256:
+            return None, None
+        token_hash = password_digest(secret)
+        key = next((item for item in STORE["integration_keys"].values()
+                    if item["token_hash"] == token_hash and not item.get("revoked_at")), None)
+        account = STORE["accounts"].get(key["organization_id"]) if key else None
+        if not account or account["status"] != "active":
+            return None, None
+        if required_scope not in key.get("scopes", []):
+            return key, "insufficient_scope"
+        permission = "workspace_write" if required_scope == "contacts:write" else "workspace_read"
+        if account["permissions"].get(permission, True) is False:
+            return key, "permission_denied"
+        key["last_used_at"] = now()
+        return key, account
+
+    def integration_account(self, user, requested):
+        if not user or user["role"] not in ("owner", "super_admin"):
+            return None
+        account = self.requested_account(user, requested)
+        if (account and user["role"] != "super_admin"
+                and account["permissions"].get("manage_settings", True) is False):
+            return None
+        return account
+
+    def integration_keys(self, user, account, action, payload):
+        if self.command == "GET" and action == "keys":
+            keys = []
+            for item in STORE["integration_keys"].values():
+                if item["organization_id"] != account["id"] or item.get("revoked_at"):
+                    continue
+                keys.append({key: item.get(key) for key in (
+                    "id", "name", "token_prefix", "scopes", "last_used_at", "created_at",
+                )})
+            keys.sort(key=lambda item: item["created_at"], reverse=True)
+            return self.reply(200, {"ok": True, "keys": keys, "maximum": 5,
+                                    "allowed_scopes": ["contacts:read", "contacts:write", "events:read"]})
+        if self.command == "POST" and action == "create-key":
+            name = str(payload.get("name", "")).strip()
+            if not name or len(name) > 80:
+                return self.fail(400, "informe um nome de até 80 caracteres")
+            scopes = payload.get("scopes", ["contacts:read"])
+            allowed_scopes = {"contacts:read", "contacts:write", "events:read"}
+            if not isinstance(scopes, list) or not scopes or any(scope not in allowed_scopes for scope in scopes):
+                return self.fail(400, "escopos inválidos")
+            scopes = sorted(set(scopes))
+            active = sum(item["organization_id"] == account["id"] and not item.get("revoked_at")
+                         for item in STORE["integration_keys"].values())
+            if active >= 5:
+                return self.fail(409, "limite de chaves ativas atingido")
+            secret = "pfk_" + secrets.token_urlsafe(32)
+            key_id = identifier()
+            STORE["integration_keys"][key_id] = {
+                "id": key_id, "organization_id": account["id"], "name": name,
+                "token_prefix": secret[:12], "token_hash": password_digest(secret), "scopes": scopes,
+                "created_by": user["id"], "created_at": now(), "last_used_at": None,
+                "revoked_at": None,
+            }
+            self.audit(user, account, "integration.key.created")
+            return self.reply(201, {"ok": True, "key": {
+                "id": key_id, "name": name, "token_prefix": secret[:12], "scopes": scopes,
+                "last_used_at": None, "created_at": STORE["integration_keys"][key_id]["created_at"],
+                "token": secret,
+            }, "notice": "copie agora; esta chave não será exibida novamente"})
+        if self.command == "POST" and action == "revoke-key":
+            key = STORE["integration_keys"].get(payload.get("key_id"))
+            if not key or key["organization_id"] != account["id"] or key.get("revoked_at"):
+                return self.fail(404, "chave não encontrada")
+            key["revoked_at"] = now()
+            self.audit(user, account, "integration.key.revoked")
+            return self.reply(200, {"ok": True, "revoked": key["id"]})
+        return self.fail(404, "ação de integração não encontrada")
+
+    def integration_bearer(self, key, account, action, payload, query):
+        workspace_record = STORE["workspaces"].setdefault(account["id"], {
+            "workspace": {"schemaVersion": 4, "leads": []}, "revision": 0, "updated_at": None,
+        })
+        if not isinstance(workspace_record.get("workspace"), dict):
+            workspace_record["workspace"] = {"schemaVersion": 4, "leads": []}
+        workspace = workspace_record["workspace"]
+        leads = workspace.setdefault("leads", [])
+        if self.command == "GET" and action == "contacts":
+            try:
+                limit, offset = int(query.get("limit", 100)), int(query.get("offset", 0))
+            except (TypeError, ValueError):
+                return self.fail(400, "paginação inválida")
+            if not 1 <= limit <= 200 or not 0 <= offset <= 100_000:
+                return self.fail(400, "paginação inválida")
+            contacts = [contact_payload(item) for item in leads if isinstance(item, dict)]
+            return self.reply(200, {"ok": True, "contacts": contacts[offset:offset + limit],
+                                    "total": len(contacts), "limit": limit, "offset": offset,
+                                    "workspace_revision": workspace_record["revision"]})
+        if self.command == "GET" and action == "events":
+            try:
+                cursor, limit = int(query.get("cursor", 0)), int(query.get("limit", 100))
+            except (TypeError, ValueError):
+                return self.fail(400, "paginação inválida")
+            if cursor < 0 or not 1 <= limit <= 200:
+                return self.fail(400, "paginação inválida")
+            events = [copy.deepcopy(item) for item in STORE["integration_events"]
+                      if item["organization_id"] == account["id"] and item["cursor"] > cursor]
+            events.sort(key=lambda item: item["cursor"])
+            page, has_more = events[:limit], len(events) > limit
+            for item in page:
+                item.pop("organization_id", None)
+            return self.reply(200, {"ok": True, "events": page,
+                                    "next_cursor": page[-1]["cursor"] if page else cursor,
+                                    "has_more": has_more})
+        if self.command != "POST" or action != "upsert-contact":
+            return self.fail(404, "ação de integração não encontrada")
+        request_id = normalized_uuid(payload.get("request_id"))
+        allowed = {"request_id", "external_id", "name", "phone", "email", "source", "interest",
+                   "tags", "notes", "board", "stage", "contract_value", "product", "niche",
+                   "revenue", "discard_reason", "recovery_at", "opt_out"}
+        if set(payload) - allowed:
+            return self.fail(400, "campos não permitidos")
+        if not request_id:
+            return self.fail(400, "request_id inválido")
+        # The request hash detects accidental reuse with a different operation while
+        # retaining only the minimum idempotency material in this local fixture.
+        request_hash = password_digest(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        request_key = (account["id"], request_id)
+        existing_request = STORE["integration_requests"].get(request_key)
+        if existing_request:
+            if existing_request["request_hash"] != request_hash:
+                return self.fail(409, "request_id já utilizado com outro conteúdo")
+            replay = copy.deepcopy(existing_request["response"])
+            replay["idempotent_replay"] = True
+            return self.reply(200, replay)
+        name = str(payload.get("name", "")).strip()
+        phone = normalized_phone(payload.get("phone")) if "phone" in payload else ""
+        external_id = str(payload.get("external_id") or "").strip()
+        if not external_id or len(external_id) > 128 or not name or len(name) > 160 or ("phone" in payload and not phone):
+            return self.fail(400, "contato inválido")
+        if "opt_out" in payload and type(payload["opt_out"]) is not bool:
+            return self.fail(400, "contato inválido")
+        lead = next((item for item in leads if isinstance(item, dict)
+                     and str(item.get("integrationExternalId") or "") == external_id), None)
+        created = lead is None
+        target_board = str(payload.get("board") or ("Principal" if created else lead.get("board", "Principal")))
+        if target_board not in {"Principal", "Remarketing", "Abandonados", "Pós-venda"}:
+            return self.fail(400, "pipeline inválido")
+        stage_field = "postSaleColumns" if target_board == "Pós-venda" else "columns"
+        stages = [str(item.get("id")) for item in workspace.get(stage_field, [])
+                  if isinstance(item, dict) and item.get("id")]
+        if not stages:
+            stages = (["onboarding", "adoption", "expansion", "renewal"]
+                      if target_board == "Pós-venda" else ["new", "service", "waiting", "closed"])
+        target_stage = str(payload.get("stage") or (stages[0] if created else lead.get("stage", stages[0])))
+        if target_stage not in stages:
+            return self.fail(400, "etapa não existe neste pipeline")
+        existing_opted_out = False if created else bool(
+            lead.get("optOut") or lead.get("opt_out") or lead.get("doNotContact"))
+        if (target_board == "Abandonados" and not existing_opted_out
+                and (created or lead.get("board") != "Abandonados")):
+            if not str(payload.get("discard_reason") or "").strip() or not payload.get("recovery_at"):
+                return self.fail(400, "informe motivo e data de recuperação")
+        if created:
+            lead = {
+                "id": identifier(), "integrationKeyId": key["id"],
+                "integrationExternalId": external_id, "name": name, "phone": phone,
+                "email": "", "origin": str(payload.get("source") or "Integração")[:120],
+                "interest": str(payload.get("interest") or "Média")[:40], "tags": [],
+                "board": target_board, "stage": target_stage,
+                "messages": [], "calls": [], "notes": "", "entered": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "product": str(payload.get("product") or "")[:120],
+                "discardReason": str(payload.get("discard_reason") or "")[:500],
+                "recoveryAt": payload.get("recovery_at") or "",
+                "consentConfirmed": False, "optOut": payload.get("opt_out") is True,
+                "automationPaused": True,
+            }
+            leads.append(lead)
+        old_board, old_stage = lead.get("board"), lead.get("stage")
+        mapping = {"name": "name", "phone": "phone", "email": "email", "source": "origin",
+                   "interest": "interest", "tags": "tags", "notes": "notes", "board": "board",
+                   "stage": "stage", "contract_value": "contractValue", "product": "product",
+                   "niche": "niche", "revenue": "revenue", "discard_reason": "discardReason",
+                   "recovery_at": "recoveryAt"}
+        for source, target in mapping.items():
+            if source in payload:
+                lead[target] = phone if source == "phone" else copy.deepcopy(payload[source])
+        if payload.get("opt_out") is True:
+            lead["optOut"] = True
+            lead["automationPaused"] = True
+        if lead.get("optOut") or lead.get("opt_out") or lead.get("doNotContact"):
+            lead["board"], lead["stage"], lead["automationPaused"] = old_board, old_stage, True
+        elif (lead.get("board"), lead.get("stage")) != (old_board, old_stage):
+            lead["entered"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+        lead["integrationKeyId"] = key["id"]
+        lead["integrationExternalId"] = external_id
+        lead["integrationUpdatedAt"] = now()
+        workspace_record["revision"] += 1
+        workspace_record["updated_at"] = now()
+        public = contact_payload(lead)
+        cursor = len(STORE["integration_events"]) + 1
+        event = {
+            "cursor": cursor, "organization_id": account["id"],
+            "event_type": "contact.created" if created else "contact.updated",
+            "resource_id": lead["id"], "payload": {"contact": {field: public[field] for field in
+                ("id", "external_id", "board", "stage", "opt_out", "automation_paused")}},
+            "created_at": now(),
+        }
+        STORE["integration_events"].append(event)
+        response = {"ok": True, "created": created, "contact": public,
+                    "workspace_revision": workspace_record["revision"],
+                    "event": {"cursor": cursor, "event_type": event["event_type"]},
+                    "idempotent_replay": False}
+        STORE["integration_requests"][request_key] = {
+            "request_hash": request_hash, "response": copy.deepcopy(response),
+        }
+        return self.reply(201 if created else 200, response)
+
     def route(self):
         if not self.local_host():
             return self.fail(403, "somente localhost")
@@ -132,8 +393,10 @@ class Handler(StaticHandler):
         action = query.get("action", "")
         payload = {}
         if self.command == "POST":
+            bearer_integration = (parsed.path == "/api/integrations"
+                                  and str(self.headers.get("Authorization", "")).startswith("Bearer "))
             source = self.headers.get("Origin") or self.headers.get("Referer", "")
-            if urlsplit(source).netloc != self.headers.get("Host"):
+            if not bearer_integration and urlsplit(source).netloc != self.headers.get("Host"):
                 return self.fail(403, "origem não permitida")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -146,6 +409,29 @@ class Handler(StaticHandler):
                 return self.fail(400, "JSON inválido")
         with LOCK:
             user = self.current_user()
+            if parsed.path == "/api/integrations":
+                authorization = str(self.headers.get("Authorization", ""))
+                if authorization.startswith("Bearer "):
+                    required_scope = {"contacts": "contacts:read", "upsert-contact": "contacts:write",
+                                      "events": "events:read"}.get(action, "contacts:read")
+                    key, account = self.integration_key(required_scope)
+                    if not key:
+                        return self.fail(401, "chave de integração inválida ou revogada")
+                    if account in ("insufficient_scope", "permission_denied"):
+                        return self.fail(403, "escopo insuficiente")
+                    return self.integration_bearer(key, account, action, payload, query)
+                source = self.headers.get("Origin") or self.headers.get("Referer", "")
+                if urlsplit(source).netloc != self.headers.get("Host"):
+                    return self.fail(403, "origem não permitida")
+                account = self.integration_account(
+                    user, query.get("organization_id") or payload.get("organization_id"))
+                if not user:
+                    return self.fail(401, "não autenticado")
+                if user["role"] not in ("owner", "super_admin"):
+                    return self.fail(403, "somente o proprietário pode gerenciar integrações")
+                if not account:
+                    return self.fail(403, "conta não autorizada")
+                return self.integration_keys(user, account, action, payload)
             if parsed.path == "/api/send-whatsapp":
                 return self.fail(410, "endpoint legado desativado")
             if parsed.path == "/api/whatsapp":

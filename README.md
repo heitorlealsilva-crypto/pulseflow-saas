@@ -11,6 +11,7 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. O administrador pode gerar um link de redefinição de senha com 30 minutos de validade e uso único para um usuário ativo; a conclusão encerra as sessões antigas. Ações administrativas são auditadas.
 - Gestão de equipe pelo proprietário: o plano Base é individual e o plano Equipe permite até três usuários ativos no mesmo espaço, com convite único de 48 horas, senha definida pelo próprio vendedor, responsável por contato e suspensão imediata de sessões.
 - Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
+- API de integração por empresa, com chave revogável, escopos, escrita idempotente de contatos e fila de eventos para sincronização com outros CRMs.
 - Termos e Política de Privacidade públicos, com aceite versionado gravado no cadastro e no convite de equipe. Os textos do MVP precisam de identificação completa do operador e revisão jurídica antes da comercialização em escala.
 - Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
 - Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
@@ -33,7 +34,7 @@ Os roteiros por nicho e sugestões locais continuam funcionando sem custo de mod
 
 Os valores de referência são **Base: R$ 9,90/mês** para uma pessoa e **Equipe: R$ 29,90/mês** para até três usuários ativos. A cobrança, assinatura e cancelamento automático por um processador de pagamento não estão integrados. A alteração de plano pelo administrador é operacional; não efetua uma cobrança.
 
-O consumo do WhatsApp oficial pertence à conta Meta do cliente. O PulseFlow não acrescenta uma mensalidade de API. Google Agenda, VoIP e outros CRMs ainda precisam de conectores e autorizações próprios; registrar manualmente uma reunião ou ligação não ativa essas integrações.
+O consumo do WhatsApp oficial pertence à conta Meta do cliente. O PulseFlow não acrescenta uma mensalidade de API. A ponte genérica por API e CSV está disponível, mas Google Agenda, VoIP e conectores específicos de cada CRM ainda precisam de autorizações próprias; registrar manualmente uma reunião ou ligação não ativa essas integrações.
 
 ## Executar localmente com o backend real
 
@@ -79,6 +80,19 @@ Abra `http://127.0.0.1:8788`. Esse processo é **uma fixture de teste local em m
 - Senha de ambas as fixtures locais: `PulseFlow-local-2026!`
 
 O contrato de teste cobre login, cadastro, sessões, dados por empresa, conflito de revisões, suporte e suspensão de acesso. Ele permite testar a interface, mas **não comprova persistência PostgreSQL nem entrega por WhatsApp**. Esses pontos exigem validação com serviços reais configurados. Os testes de segurança dos handlers ficam separados das fixtures de navegação.
+
+## Integrar outro CRM pela API
+
+O proprietário da empresa cria e revoga chaves em **Configurações → Conta e dados → API para outros sistemas**. Ele escolhe separadamente as permissões de leitura, escrita e eventos; quando nenhuma é informada diretamente à API de gestão, a chave nasce somente com leitura. A chave completa aparece uma única vez e o banco armazena somente seu hash. O sistema externo deve enviá-la no cabeçalho `Authorization: Bearer <chave>`; a empresa é sempre determinada pela chave, nunca por um identificador fornecido pelo cliente externo.
+
+- `GET /api/integrations?action=contacts`: lista a visão permitida dos contatos, com paginação por `limit` e `offset`.
+- `POST /api/integrations?action=upsert-contact`: cria ou atualiza por `external_id`, que deve ser único na empresa e pode receber um prefixo do sistema de origem, como `meucrm:123`. A troca da chave não duplica esse contato. Cada escrita exige `request_id` UUID; repetir a mesma requisição é seguro e reutilizar o UUID com outro conteúdo é bloqueado.
+- `GET /api/integrations?action=events`: entrega a fila de mudanças por `cursor`, para sincronização incremental.
+- `GET /api/integrations?action=keys`, `POST ...?action=create-key` e `POST ...?action=revoke-key`: rotas do navegador autenticado para o proprietário ou administrador; não são rotas para o CRM externo.
+
+Uma integração pode consultar ou alterar apenas os campos permitidos: identificação, contato, origem, interesse, tags, notas, pipeline, etapa, contrato, produto, nicho e faturamento. Para entrar em `Abandonados`, também são obrigatórios `discard_reason` e `recovery_at` em ISO 8601 com fuso e data futura. Ela não recebe conversas, chamadas, memória da IA, equipe ou configurações. Contatos novos entram com automação pausada e sem consentimento presumido; um pedido de não contato pode ser acrescentado, mas nunca removido pela API.
+
+Webhooks de saída não fazem parte desta primeira ponte: o consumo incremental de `events` é o caminho confiável enquanto o agendador da hospedagem roda apenas diariamente. Registros de idempotência são mantidos por 7 dias e eventos por 90 dias; o consumidor deve salvar seu cursor e sincronizar regularmente.
 
 ## Integrar o WhatsApp oficial
 

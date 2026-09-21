@@ -496,6 +496,30 @@ class handler(BaseHTTPRequestHandler):
         company_name = str(workspace.get("whatsapp", {}).get("businessName") or account["name"]).strip()[:200] or account["name"]
         db.execute("UPDATE organizations SET name=%s,niche=%s,whatsapp=%s WHERE id=%s", (company_name, niche, str(number)[:32], organization_id))
         account["name"] = company_name
+        previous_leads = {str(item.get("id")): item for item in previous.get("leads", [])
+                          if isinstance(item, dict) and item.get("id")}
+        current_leads = {str(item.get("id")): item for item in workspace.get("leads", [])
+                         if isinstance(item, dict) and item.get("id")}
+        changed_lead_ids = sorted(key for key in set(previous_leads) | set(current_leads)
+                                  if previous_leads.get(key) != current_leads.get(key))
+        if changed_lead_ids:
+            relations = db.execute("""SELECT to_regclass('public.integration_api_keys') AS keys_table,
+                to_regclass('public.integration_events') AS events_table""").fetchone()
+            active_key = None
+            if relations and relations.get("keys_table") and relations.get("events_table"):
+                active_key = db.execute("""SELECT 1 FROM integration_api_keys
+                    WHERE organization_id=%s AND revoked_at IS NULL AND scopes ? 'events:read' LIMIT 1""",
+                                        (organization_id,)).fetchone()
+            if active_key:
+                event_payload = {
+                    "revision": saved["revision"],
+                    "contact_ids": changed_lead_ids[:100],
+                    "changed_count": len(changed_lead_ids),
+                    "truncated": len(changed_lead_ids) > 100,
+                }
+                db.execute("""INSERT INTO integration_events(organization_id,event_type,resource_id,payload)
+                    VALUES(%s,'contacts.changed',NULL,%s::jsonb)""",
+                           (organization_id, json.dumps(event_payload)))
         if user["role"] == "super_admin":
             self.audit(db, user, organization_id, "support.workspace.updated", {"revision": saved["revision"], "changed_fields": sorted(key for key in set(previous) | set(workspace) if previous.get(key) != workspace.get(key))})
         db.commit()
