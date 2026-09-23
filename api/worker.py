@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 
 from api import ai as ai_service
+from api import integration_events
 from api.auth import connect, ensure_schema
 from api.runtime import ensure_schema as ensure_runtime_schema, persist_alert
 
@@ -290,6 +291,11 @@ def ensure_worker_schema(db):
     db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS ai_jobs_queued INTEGER NOT NULL DEFAULT 0")
     db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS ai_analyses_completed INTEGER NOT NULL DEFAULT 0")
     db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS ai_analyses_failed INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS webhook_deliveries_claimed INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS webhook_deliveries_delivered INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS webhook_deliveries_retried INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS webhook_deliveries_dead INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS webhook_endpoints_paused INTEGER NOT NULL DEFAULT 0")
 
 
 def materialize_action(db, organization_id, workspace, action, now):
@@ -653,7 +659,9 @@ def run_batch(db, now=None, limit=MAX_TENANTS_PER_RUN):
         return {"ok": True, "alreadyRunning": True, "tenantsScanned": 0,
                 "actionsCreated": 0, "aiJobsQueued": 0,
                 "aiAnalysesCompleted": 0, "aiAnalysesFailed": 0,
-                "aiAnalysesDeferred": 0}
+                "aiAnalysesDeferred": 0, "webhookDeliveriesClaimed": 0,
+                "webhookDeliveriesDelivered": 0, "webhookDeliveriesRetried": 0,
+                "webhookDeliveriesDead": 0, "webhookEndpointsPaused": 0}
     run = db.execute("INSERT INTO worker_runs(started_at,status) VALUES(%s,'running') RETURNING id", (now,)).fetchone()
     run_id = run["id"]
     db.commit()
@@ -720,16 +728,32 @@ def run_batch(db, now=None, limit=MAX_TENANTS_PER_RUN):
         db.execute("""UPDATE worker_runs SET tenants_scanned=%s,actions_created=%s,
             ai_jobs_queued=%s WHERE id=%s""", (scanned, created, queued, run_id))
         db.commit()
+        # Tenant workspace rows have all been committed at this point.  Webhook
+        # delivery performs customer-controlled network I/O, so it must never
+        # run while a workspace row lock is held.
+        webhook_stats = integration_events.process_deliveries(db, limit=20)
+        integration_events.cleanup_history(db, now, limit=500)
         ai_stats = process_ai_jobs(db, now, MAX_AI_ANALYSES_PER_RUN)
         db.execute("""
             UPDATE worker_runs SET finished_at=NOW(),tenants_scanned=%s,actions_created=%s,
-                ai_jobs_queued=%s,ai_analyses_completed=%s,ai_analyses_failed=%s,status='completed'
+                ai_jobs_queued=%s,ai_analyses_completed=%s,ai_analyses_failed=%s,
+                webhook_deliveries_claimed=%s,webhook_deliveries_delivered=%s,
+                webhook_deliveries_retried=%s,webhook_deliveries_dead=%s,
+                webhook_endpoints_paused=%s,status='completed'
             WHERE id=%s
-        """, (scanned, created, queued, ai_stats["completed"], ai_stats["failed"], run_id))
+        """, (scanned, created, queued, ai_stats["completed"], ai_stats["failed"],
+              webhook_stats["claimed"], webhook_stats["delivered"],
+              webhook_stats["retry"], webhook_stats["dead"],
+              webhook_stats["paused"], run_id))
         db.commit()
         return {"ok": True, "tenantsScanned": scanned, "actionsCreated": created,
                 "aiJobsQueued": queued, "aiAnalysesCompleted": ai_stats["completed"],
-                "aiAnalysesFailed": ai_stats["failed"], "aiAnalysesDeferred": ai_stats["deferred"]}
+                "aiAnalysesFailed": ai_stats["failed"], "aiAnalysesDeferred": ai_stats["deferred"],
+                "webhookDeliveriesClaimed": webhook_stats["claimed"],
+                "webhookDeliveriesDelivered": webhook_stats["delivered"],
+                "webhookDeliveriesRetried": webhook_stats["retry"],
+                "webhookDeliveriesDead": webhook_stats["dead"],
+                "webhookEndpointsPaused": webhook_stats["paused"]}
     except Exception:
         db.rollback()
         # Keep production responses free of database/contact details.

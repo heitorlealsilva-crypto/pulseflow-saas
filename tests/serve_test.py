@@ -31,7 +31,7 @@ LEGAL_VERSION = "2026-09-20"
 LOCK = threading.RLock()
 STORE = {
     "accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [],
-    "invites": {}, "password_resets": {}, "integration_keys": {},
+    "invites": {}, "password_resets": {}, "integration_keys": {}, "integration_webhooks": {},
     "integration_requests": {}, "integration_events": [],
 }
 
@@ -89,6 +89,24 @@ def contact_payload(value):
         "opt_out": bool(value.get("optOut") or value.get("opt_out") or value.get("doNotContact")),
         "automation_paused": value.get("automationPaused") is True,
         "updated_at": value.get("integrationUpdatedAt"),
+    }
+
+
+WEBHOOK_EVENTS = {
+    "contact.created", "contact.updated", "contact.stage_changed",
+    "contact.deleted", "contact.reply_received", "contacts.resync_required",
+}
+
+
+def public_webhook(value):
+    parsed = urlsplit(value["endpoint_url"])
+    return {
+        "id": value["id"], "name": value["name"],
+        "url": f"{parsed.scheme}://{parsed.netloc}/…", "host": parsed.hostname,
+        "event_types": copy.deepcopy(value["event_types"]), "status": value["status"],
+        "created_at": value["created_at"], "updated_at": value["updated_at"],
+        "last_delivery_at": value.get("last_delivery_at"),
+        "last_status_code": value.get("last_status_code"), "last_error": value.get("last_error"),
     }
 
 
@@ -242,6 +260,58 @@ class Handler(StaticHandler):
             key["revoked_at"] = now()
             self.audit(user, account, "integration.key.revoked")
             return self.reply(200, {"ok": True, "revoked": key["id"]})
+        if self.command == "GET" and action == "webhooks":
+            hooks = [public_webhook(item) for item in STORE["integration_webhooks"].values()
+                     if item["organization_id"] == account["id"] and not item.get("revoked_at")]
+            hooks.sort(key=lambda item: item["created_at"], reverse=True)
+            return self.reply(200, {"ok": True, "webhooks": hooks, "maximum": 3,
+                                    "allowed_event_types": sorted(WEBHOOK_EVENTS)})
+        if self.command == "POST" and action == "create-webhook":
+            if account.get("plan") != "Equipe":
+                return self.fail(403, "webhooks de saída exigem o plano Equipe")
+            name, endpoint = str(payload.get("name", "")).strip(), str(payload.get("url", "")).strip()
+            event_types = payload.get("event_types")
+            parsed = urlsplit(endpoint)
+            if not name or len(name) > 80:
+                return self.fail(400, "informe um nome de até 80 caracteres")
+            if len(endpoint) > 2048 or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                return self.fail(400, "informe uma URL HTTPS válida")
+            if (not isinstance(event_types, list) or not event_types
+                    or any(item not in WEBHOOK_EVENTS for item in event_types)):
+                return self.fail(400, "eventos inválidos")
+            active = sum(item["organization_id"] == account["id"] and not item.get("revoked_at")
+                         for item in STORE["integration_webhooks"].values())
+            if active >= 3:
+                return self.fail(409, "limite de webhooks ativos atingido")
+            secret, webhook_id, timestamp = "whsec_" + secrets.token_urlsafe(32), identifier(), now()
+            record = {
+                "id": webhook_id, "organization_id": account["id"], "name": name,
+                "endpoint_url": endpoint, "secret_hash": password_digest(secret),
+                "event_types": sorted(set(event_types)), "status": "active",
+                "created_by": user["id"], "created_at": timestamp, "updated_at": timestamp,
+                "last_delivery_at": None, "last_status_code": None, "last_error": None,
+                "revoked_at": None,
+            }
+            STORE["integration_webhooks"][webhook_id] = record
+            self.audit(user, account, "integration.webhook.created")
+            return self.reply(201, {"ok": True, "webhook": {**public_webhook(record), "secret": secret},
+                                    "notice": "copie agora; este segredo não será exibido novamente"})
+        if self.command == "POST" and action in ("revoke-webhook", "test-webhook"):
+            hook = STORE["integration_webhooks"].get(payload.get("webhook_id"))
+            if not hook or hook["organization_id"] != account["id"] or hook.get("revoked_at"):
+                return self.fail(404, "webhook não encontrado")
+            if action == "revoke-webhook":
+                hook["revoked_at"], hook["status"], hook["updated_at"] = now(), "revoked", now()
+                self.audit(user, account, "integration.webhook.revoked")
+                return self.reply(200, {"ok": True, "revoked": hook["id"]})
+            if account.get("plan") != "Equipe":
+                return self.fail(403, "webhooks de saída exigem o plano Equipe")
+            timestamp, delivery_id = now(), identifier()
+            hook["updated_at"] = timestamp
+            self.audit(user, account, "integration.webhook.tested")
+            return self.reply(202, {"ok": True, "delivery": {
+                "id": delivery_id, "status": "pending", "created_at": timestamp,
+            }, "status_code": None, "duration_ms": None})
         return self.fail(404, "ação de integração não encontrada")
 
     def integration_bearer(self, key, account, action, payload, query):

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 import psycopg
 
+from api import integration_events
 from api.auth import connect, ensure_schema as ensure_core_schema, normalized_origin
 
 
@@ -78,10 +79,11 @@ def ensure_schema(db):
     ]
     for statement in statements:
         db.execute(statement)
-    # The cursor feed is an operational sync queue, not permanent history.
-    # Idempotency records only need to cover realistic retry windows.
+    integration_events.ensure_schema(db)
+    # Idempotency records only need to cover realistic retry windows. Event
+    # and delivery retention runs in bounded batches inside the worker so a
+    # user request never owns an unbounded cleanup transaction.
     db.execute("DELETE FROM integration_requests WHERE created_at < NOW() - INTERVAL '7 days'")
-    db.execute("DELETE FROM integration_events WHERE created_at < NOW() - INTERVAL '90 days'")
     db.commit()
     _SCHEMA_READY_FOR = database_key
 
@@ -301,6 +303,18 @@ class handler(BaseHTTPRequestHandler):
                         ORDER BY created_at DESC""", (organization_id,)).fetchall()
                     return self.reply(200, {"ok": True, "keys": [public_key(row) for row in rows],
                                             "maximum": MAX_ACTIVE_KEYS, "allowed_scopes": sorted(ALLOWED_SCOPES)})
+                if action == "webhooks":
+                    reject_unexpected(query, ("action", "organization_id"))
+                    self.check_same_origin()
+                    user = self.session_user(db)
+                    organization_id = self.management_org(
+                        db, user, query.get("organization_id", ""), allow_suspended=True)
+                    return self.reply(200, {
+                        "ok": True,
+                        "webhooks": integration_events.list_endpoints(db, organization_id),
+                        "maximum": integration_events.MAX_ENDPOINTS_PER_ORGANIZATION,
+                        "allowed_event_types": sorted(integration_events.SUPPORTED_EVENT_TYPES),
+                    })
                 if action == "contacts":
                     reject_unexpected(query, ("action", "limit", "offset"))
                     key = self.api_key(db, "contacts:read")
@@ -320,7 +334,8 @@ class handler(BaseHTTPRequestHandler):
                     key = self.api_key(db, "events:read")
                     cursor = self.integer_query(query.get("cursor", "0"), "cursor", 0, 9_223_372_036_854_775_807)
                     limit = self.integer_query(query.get("limit", "100"), "limit", 1, 200)
-                    rows = db.execute("""SELECT id AS cursor,event_type,resource_id,payload,created_at
+                    rows = db.execute("""SELECT id AS cursor,event_id,schema_version,
+                        event_type,resource_id,payload,created_at
                         FROM integration_events WHERE organization_id=%s AND id>%s
                         ORDER BY id LIMIT %s""", (key["organization_id"], cursor, limit + 1)).fetchall()
                     has_more = len(rows) > limit
@@ -332,6 +347,8 @@ class handler(BaseHTTPRequestHandler):
                 raise IntegrationAPIError("ação não encontrada", "not_found", 404)
         except IntegrationAPIError as error:
             return self.reply(error.status, {"ok": False, "error": str(error), "code": error.code, **error.details})
+        except integration_events.IntegrationEventError as error:
+            return self.reply(error.status, {"ok": False, "error": str(error), "code": error.code})
         except Exception:
             return self.reply(503, {"ok": False, "error": "serviço indisponível", "code": "service_unavailable"})
 
@@ -351,18 +368,27 @@ class handler(BaseHTTPRequestHandler):
             payload = self.body()
             with connect() as db:
                 ensure_schema(db)
-                if action in ("create-key", "revoke-key"):
+                if action in ("create-key", "revoke-key", "create-webhook",
+                              "revoke-webhook", "test-webhook"):
                     self.check_same_origin()
                     user = self.session_user(db)
                     if action == "create-key":
                         return self.create_key(db, user, payload)
-                    return self.revoke_key(db, user, payload)
+                    if action == "revoke-key":
+                        return self.revoke_key(db, user, payload)
+                    if action == "create-webhook":
+                        return self.create_webhook(db, user, payload)
+                    if action == "revoke-webhook":
+                        return self.revoke_webhook(db, user, payload)
+                    return self.test_webhook(db, user, payload)
                 if action == "upsert-contact":
                     key = self.api_key(db, "contacts:write")
                     return self.upsert_contact(db, key, payload)
                 raise IntegrationAPIError("ação não encontrada", "not_found", 404)
         except IntegrationAPIError as error:
             return self.reply(error.status, {"ok": False, "error": str(error), "code": error.code, **error.details})
+        except integration_events.IntegrationEventError as error:
+            return self.reply(error.status, {"ok": False, "error": str(error), "code": error.code})
         except psycopg.errors.UniqueViolation:
             return self.reply(409, {"ok": False, "error": "registro duplicado", "code": "conflict"})
         except Exception:
@@ -412,6 +438,60 @@ class handler(BaseHTTPRequestHandler):
                    {"key_id": key_id, "name": row["name"]})
         db.commit()
         return self.reply(200, {"ok": True, "revoked": key_id})
+
+    def create_webhook(self, db, user, payload):
+        reject_unexpected(payload, ("organization_id", "name", "url", "event_types"))
+        organization_id = self.management_org(
+            db, user, payload.get("organization_id", ""), lock=True)
+        account = db.execute("SELECT plan,status FROM organizations WHERE id=%s",
+                             (organization_id,)).fetchone() or {}
+        if account.get("plan") != "Equipe":
+            raise IntegrationAPIError(
+                "Webhooks de saída estão disponíveis no plano Equipe.",
+                "plan_required", 403)
+        webhook = integration_events.create_endpoint(
+            db, organization_id,
+            name=payload.get("name"), url=payload.get("url"),
+            event_types=payload.get("event_types"), created_by=user.get("id"))
+        self.audit(db, user["id"], organization_id, "integration.webhook.created", {
+            "webhook_id": webhook["id"], "name": webhook["name"],
+            "event_types": webhook["event_types"],
+        })
+        db.commit()
+        return self.reply(201, {"ok": True, "webhook": webhook,
+                                "notice": "copie o segredo agora; ele não será exibido novamente"})
+
+    def revoke_webhook(self, db, user, payload):
+        reject_unexpected(payload, ("organization_id", "webhook_id"))
+        organization_id = self.management_org(
+            db, user, payload.get("organization_id", ""), lock=True,
+            allow_suspended=True)
+        webhook = integration_events.revoke_endpoint(
+            db, organization_id, payload.get("webhook_id"))
+        self.audit(db, user["id"], organization_id, "integration.webhook.revoked", {
+            "webhook_id": webhook["id"], "name": webhook["name"],
+        })
+        db.commit()
+        return self.reply(200, {"ok": True, "revoked": webhook["id"]})
+
+    def test_webhook(self, db, user, payload):
+        reject_unexpected(payload, ("organization_id", "webhook_id"))
+        organization_id = self.management_org(
+            db, user, payload.get("organization_id", ""), lock=True)
+        account = db.execute("SELECT plan FROM organizations WHERE id=%s",
+                             (organization_id,)).fetchone() or {}
+        if account.get("plan") != "Equipe":
+            raise IntegrationAPIError(
+                "Webhooks de saída estão disponíveis no plano Equipe.",
+                "plan_required", 403)
+        result = integration_events.enqueue_test_delivery(
+            db, organization_id, payload.get("webhook_id"))
+        self.audit(db, user["id"], organization_id, "integration.webhook.test_queued", {
+            "webhook_id": normalized_uuid(payload.get("webhook_id"), "webhook"),
+            "delivery_id": result["delivery"]["id"],
+        })
+        db.commit()
+        return self.reply(202, {"ok": True, **result})
 
     def validate_contact(self, payload):
         allowed = ("request_id", "external_id", "name", "phone", "email", "source", "interest",
@@ -518,7 +598,9 @@ class handler(BaseHTTPRequestHandler):
         stages = self.valid_stages(workspace, target_board)
         if "stage" in values and values["stage"] not in stages:
             raise IntegrationAPIError("etapa não existe neste pipeline", "invalid_stage")
-        current_stage = "" if created else str(lead.get("stage", ""))
+        previous_board = None if created else lead.get("board")
+        previous_stage = None if created else lead.get("stage")
+        current_stage = "" if created else str(previous_stage or "")
         target_stage = values.get("stage") or (current_stage if current_stage in stages else stages[0])
         existing_opted_out = False if created else bool(
             lead.get("optOut") or lead.get("opt_out") or lead.get("doNotContact"))
@@ -551,7 +633,7 @@ class handler(BaseHTTPRequestHandler):
             }
             leads.append(lead)
         else:
-            old_board, old_stage = lead.get("board"), lead.get("stage")
+            old_board, old_stage = previous_board, previous_stage
             mapping = {
                 "name": "name", "phone": "phone", "email": "email", "source": "origin",
                 "interest": "interest", "tags": "tags", "notes": "notes", "board": "board",
@@ -585,16 +667,22 @@ class handler(BaseHTTPRequestHandler):
             state=EXCLUDED.state,revision=EXCLUDED.revision,updated_at=NOW()""",
                    (organization_id, encoded, revision))
         contact = public_contact(lead)
-        event = db.execute("""INSERT INTO integration_events
-            (organization_id,event_type,resource_id,payload)
-            VALUES(%s,%s,%s,%s::jsonb) RETURNING id,created_at""",
-            (organization_id, "contact.created" if created else "contact.updated",
-             lead["id"], json.dumps({"contact": {key: contact[key] for key in
-                 ("id", "external_id", "board", "stage", "opt_out", "automation_paused")}}))).fetchone()
+        event_type = "contact.created" if created else "contact.updated"
+        event_payload = integration_events.contact_event_payload(
+            contact, workspace_revision=revision)
+        event = integration_events.emit_event(
+            db, organization_id, event_type, str(lead["id"]), event_payload, now=now)
+        if (not created and (lead.get("board"), lead.get("stage"))
+                != (previous_board, previous_stage)):
+            integration_events.emit_event(
+                db, organization_id, "contact.stage_changed", str(lead["id"]),
+                integration_events.stage_changed_payload(
+                    contact, {"board": previous_board, "stage": previous_stage},
+                    workspace_revision=revision), now=now)
         response = {"ok": True, "created": created, "contact": contact,
                     "workspace_revision": revision,
-                    "event": {"cursor": event["id"],
-                              "event_type": "contact.created" if created else "contact.updated"}}
+                    "event": {"cursor": event.get("cursor"),
+                              "event_id": event["id"], "event_type": event_type}}
         db.execute("""INSERT INTO integration_requests
             (organization_id,request_id,api_key_id,request_hash,response)
             VALUES(%s,%s,%s,%s,%s::jsonb)""",

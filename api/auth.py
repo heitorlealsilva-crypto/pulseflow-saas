@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 import psycopg
 from psycopg.rows import dict_row
 
+from api import integration_events
+
 MAX_BODY_BYTES = 2_000_000
 LEGAL_VERSION = "2026-09-20"
 PERMISSIONS = ("workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage")
@@ -126,6 +128,7 @@ def ensure_schema(db):
     """, "CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry_idx ON auth_rate_limits(resets_at)"]
     for statement in statements:
         db.execute(statement)
+    integration_events.ensure_schema(db)
     admin_email = os.getenv("PULSEFLOW_ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("PULSEFLOW_ADMIN_PASSWORD", "")
     if admin_email and len(admin_password) >= 12:
@@ -503,23 +506,64 @@ class handler(BaseHTTPRequestHandler):
         changed_lead_ids = sorted(key for key in set(previous_leads) | set(current_leads)
                                   if previous_leads.get(key) != current_leads.get(key))
         if changed_lead_ids:
-            relations = db.execute("""SELECT to_regclass('public.integration_api_keys') AS keys_table,
-                to_regclass('public.integration_events') AS events_table""").fetchone()
-            active_key = None
-            if relations and relations.get("keys_table") and relations.get("events_table"):
-                active_key = db.execute("""SELECT 1 FROM integration_api_keys
-                    WHERE organization_id=%s AND revoked_at IS NULL AND scopes ? 'events:read' LIMIT 1""",
-                                        (organization_id,)).fetchone()
-            if active_key:
-                event_payload = {
-                    "revision": saved["revision"],
-                    "contact_ids": changed_lead_ids[:100],
-                    "changed_count": len(changed_lead_ids),
-                    "truncated": len(changed_lead_ids) > 100,
-                }
-                db.execute("""INSERT INTO integration_events(organization_id,event_type,resource_id,payload)
-                    VALUES(%s,'contacts.changed',NULL,%s::jsonb)""",
-                           (organization_id, json.dumps(event_payload)))
+            has_subscription = False
+            if (account.get("plan") == "Equipe"
+                    and account.get("permissions", {}).get("workspace_read", True)):
+                webhook_subscription = db.execute("""SELECT EXISTS(
+                    SELECT 1 FROM integration_webhook_endpoints
+                    WHERE organization_id=%s AND status='active') AS subscribed""",
+                    (organization_id,)).fetchone()
+                has_subscription = bool(
+                    webhook_subscription and webhook_subscription.get("subscribed"))
+            if not has_subscription:
+                # The generic API schema is initialized by /api/integrations,
+                # not by a fresh authentication deployment. Never reference
+                # its table until PostgreSQL confirms that it exists.
+                relation = db.execute(
+                    "SELECT to_regclass('public.integration_api_keys') AS keys_table"
+                ).fetchone()
+                if relation and relation.get("keys_table"):
+                    active_key = db.execute("""SELECT 1 FROM integration_api_keys
+                        WHERE organization_id=%s AND revoked_at IS NULL
+                          AND scopes ? 'events:read' LIMIT 1""",
+                        (organization_id,)).fetchone()
+                    has_subscription = bool(active_key)
+            if has_subscription:
+                emitted_at = utcnow()
+                for lead_id in changed_lead_ids[:100]:
+                    before, after = previous_leads.get(lead_id), current_leads.get(lead_id)
+                    if after is None:
+                        deleted = {**(before or {}), "id": lead_id}
+                        integration_events.emit_event(
+                            db, organization_id, "contact.deleted", lead_id,
+                            integration_events.contact_event_payload(
+                                deleted, workspace_revision=saved["revision"]),
+                            now=emitted_at)
+                        continue
+                    contact = {**after, "id": lead_id}
+                    event_type = "contact.created" if before is None else "contact.updated"
+                    integration_events.emit_event(
+                        db, organization_id, event_type, lead_id,
+                        integration_events.contact_event_payload(
+                            contact, workspace_revision=saved["revision"]),
+                        now=emitted_at)
+                    if (before is not None
+                            and (before.get("board"), before.get("stage"))
+                            != (after.get("board"), after.get("stage"))):
+                        integration_events.emit_event(
+                            db, organization_id, "contact.stage_changed", lead_id,
+                            integration_events.stage_changed_payload(
+                                contact, before,
+                                workspace_revision=saved["revision"]),
+                            now=emitted_at)
+                if len(changed_lead_ids) > 100:
+                    integration_events.emit_event(
+                        db, organization_id, "contacts.resync_required", None, {
+                        "workspace_revision": saved["revision"],
+                        "changed_count": len(changed_lead_ids),
+                        "reason": "bulk_change",
+                        "contacts_endpoint": "/api/integrations?action=contacts",
+                    }, now=emitted_at)
         if user["role"] == "super_admin":
             self.audit(db, user, organization_id, "support.workspace.updated", {"revision": saved["revision"], "changed_fields": sorted(key for key in set(previous) | set(workspace) if previous.get(key) != workspace.get(key))})
         db.commit()
@@ -546,6 +590,22 @@ class handler(BaseHTTPRequestHandler):
             raise RequestError("informe uma alteração de conta")
         account.update(changes)
         db.execute("UPDATE organizations SET status=%s,plan=%s,permissions=%s::jsonb WHERE id=%s", (account["status"], account["plan"], json.dumps(account["permissions"]), organization_id))
+        webhooks_allowed = (account["status"] == "active"
+                            and account["plan"] == "Equipe"
+                            and account["permissions"].get("workspace_read", True))
+        if not webhooks_allowed:
+            reason = ("account_suspended" if account["status"] != "active"
+                      else "plan_required" if account["plan"] != "Equipe"
+                      else "workspace_read_disabled")
+            db.execute("""UPDATE integration_webhook_endpoints
+                SET status='paused',paused_at=NOW(),last_error=%s,updated_at=NOW()
+                WHERE organization_id=%s AND status='active'""",
+                (reason, organization_id))
+            db.execute("""UPDATE integration_webhook_deliveries
+                SET status='cancelled',error_code=%s,lease_token=NULL,leased_at=NULL,
+                    updated_at=NOW()
+                WHERE organization_id=%s AND status IN ('pending','retry','running')""",
+                (reason, organization_id))
         if account["status"] == "suspended":
             db.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE organization_id=%s)", (organization_id,))
         self.audit(db, user, organization_id, "admin.account.updated", changes)

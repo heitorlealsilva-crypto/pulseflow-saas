@@ -11,7 +11,7 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Administração global para consultar empresas e usuários, abrir uma empresa em modo suporte e controlar acessos. O administrador pode gerar um link de redefinição de senha com 30 minutos de validade e uso único para um usuário ativo; a conclusão encerra as sessões antigas. Ações administrativas são auditadas.
 - Gestão de equipe pelo proprietário: o plano Base é individual e o plano Equipe permite até três usuários ativos no mesmo espaço, com convite único de 48 horas, senha definida pelo próprio vendedor, responsável por contato e suspensão imediata de sessões.
 - Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
-- API de integração por empresa, com chave revogável, escopos, escrita idempotente de contatos e fila de eventos para sincronização com outros CRMs.
+- API de integração por empresa, com chave revogável, escopos, escrita idempotente de contatos, fila de eventos e webhooks de saída assinados para sincronização com outros CRMs.
 - Termos e Política de Privacidade públicos, com aceite versionado gravado no cadastro e no convite de equipe. Os textos do MVP precisam de identificação completa do operador e revisão jurídica antes da comercialização em escala.
 - Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
 - Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
@@ -57,7 +57,7 @@ Variáveis de ambiente:
 | `PULSEFLOW_APP_URL` | Endereço público HTTPS do SaaS; usado para origem e webhook. |
 | `PULSEFLOW_ADMIN_EMAIL` | E-mail do administrador inicial. |
 | `PULSEFLOW_ADMIN_PASSWORD` | Senha forte do administrador inicial, fornecida como segredo no servidor. |
-| `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp. Manter backup seguro. |
+| `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp, URLs e segredos dos webhooks de saída. Manter backup seguro. |
 | `META_GRAPH_VERSION` | Versão da Graph API adotada pela integração, quando configurada. |
 | `CRON_SECRET` | Segredo com pelo menos 16 caracteres, enviado como `Authorization: Bearer ...` pelo cron ou agendador externo. |
 | `OPENAI_API_KEY` | Chave do projeto OpenAI usada somente pelo backend para analisar conversas. |
@@ -95,7 +95,13 @@ O proprietário da empresa cria e revoga chaves em **Configurações → Conta e
 
 Uma integração pode consultar ou alterar apenas os campos permitidos: identificação, contato, origem, interesse, tags, notas, pipeline, etapa, contrato, produto, nicho e faturamento. Para entrar em `Abandonados`, também são obrigatórios `discard_reason` e `recovery_at` em ISO 8601 com fuso e data futura. Ela não recebe conversas, chamadas, memória da IA, equipe ou configurações. Contatos novos entram com automação pausada e sem consentimento presumido; um pedido de não contato pode ser acrescentado, mas nunca removido pela API.
 
-Webhooks de saída não fazem parte desta primeira ponte: o consumo incremental de `events` é o caminho confiável enquanto o agendador da hospedagem roda apenas diariamente. Registros de idempotência são mantidos por 7 dias e eventos por 90 dias; o consumidor deve salvar seu cursor e sincronizar regularmente.
+No plano Equipe, o proprietário também pode cadastrar até três destinos em **API para outros sistemas → Webhooks de saída**. Cada entrega automática acontece no ciclo do agendador — hoje, com janela esperada de cerca de 30 minutos — por meio de um `POST` JSON assinado com HMAC-SHA256 no cabeçalho `X-PulseFlow-Signature`; os cabeçalhos `X-PulseFlow-Timestamp`, `X-PulseFlow-Event-Id`, `X-PulseFlow-Delivery-Id` e `X-PulseFlow-Event-Type` permitem validar frescor, idempotência e tipo. A assinatura usa `v1=` seguido do hexadecimal de `HMAC(segredo, timestamp + "." + corpo_bruto)`. O segredo completo aparece somente na criação.
+
+Os eventos contêm apenas identificadores, pipeline/etapa, estado de bloqueio ou pausa e horário necessários à sincronização. Conversas, notas, ligações, telefone, e-mail e memória da IA não são enviados. Destinos aceitam somente HTTPS público na porta 443; endereços locais, metadados de nuvem, IP literal, redirecionamento e chamada ao próprio PulseFlow são bloqueados. Falhas transitórias entram em retentativa com espera crescente; `410 Gone` ou o esgotamento das tentativas pausa o destino para impedir tráfego indefinido.
+
+Os tipos disponíveis são `contact.created`, `contact.updated`, `contact.stage_changed`, `contact.deleted`, `contact.reply_received` e `contacts.resync_required`. Em alterações em massa com mais de 100 contatos, o último substitui centenas de notificações individuais e orienta o sistema conectado a buscar novamente os dados pela API.
+
+O consumo incremental de `events` continua disponível como reconciliação confiável: o consumidor deve salvar o cursor e consultar periodicamente para cobrir indisponibilidades do seu endpoint. Registros de idempotência são mantidos por 7 dias e eventos por 90 dias; eventos com entrega ainda pendente não são removidos pela retenção.
 
 ## Integrar o WhatsApp oficial
 

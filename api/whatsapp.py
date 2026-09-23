@@ -21,6 +21,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+from api import integration_events
 from api.runtime import apply_inbound_response, ensure_schema as ensure_runtime_schema, persist_alert
 
 MAX_BODY = 2_000_000
@@ -67,6 +68,11 @@ def ensure_schema(db):
     schema_key = os.getenv("DATABASE_URL") or os.getenv("STORAGE_URL")
     if schema_key and _SCHEMA_READY_FOR == schema_key:
         return
+    # The WhatsApp tables and the integration outbox both reference core
+    # tenant tables. Initializing core first keeps a cold deployment safe
+    # even when Meta's webhook is the first endpoint that receives traffic.
+    from api.auth import ensure_schema as ensure_core_schema
+    ensure_core_schema(db)
     db.execute("SELECT pg_advisory_xact_lock(817405202)")
     statements = [
         "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb",
@@ -107,8 +113,36 @@ def ensure_schema(db):
     for statement in statements:
         db.execute(statement)
     ensure_runtime_schema(db, schema_key)
+    integration_events.ensure_schema(db)
     db.commit()
     _SCHEMA_READY_FOR = schema_key
+
+
+def emit_contact_reply_event(db, organization_id, lead, inbound):
+    """Publish the privacy-minimal event for one applied inbound reply.
+
+    Message text, contact identity, phone, notes, calls and AI state remain in
+    the tenant workspace. External consumers only receive the identifiers
+    needed to reconcile the contact and message, plus the cadence pause flag.
+    """
+    occurred_at = inbound.get("occurred_at")
+    if isinstance(occurred_at, datetime):
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        event_time = occurred_at.astimezone(timezone.utc)
+        occurred_at_value = event_time.isoformat().replace("+00:00", "Z")
+    else:
+        event_time = occurred_at
+        occurred_at_value = str(occurred_at or "")
+    return integration_events.emit_event(
+        db,
+        organization_id,
+        "contact.reply_received",
+        str(lead["id"]),
+        integration_events.reply_received_payload(
+            lead, inbound["message_id"], occurred_at_value),
+        now=event_time,
+    )
 
 
 def session_user(db, header):
@@ -576,6 +610,9 @@ class handler(BaseHTTPRequestHandler):
                           if lead.get("automationPaused") else
                           "A resposta foi registrada. A regra desta etapa mantém a cadência ativa."),
                     at=inbound["occurred_at"], payload={"messageId": inbound["message_id"]})
+                if integration_events.has_consumers(
+                        db, organization_id, "contact.reply_received"):
+                    emit_contact_reply_event(db, organization_id, lead, inbound)
             if changed:
                 scheduled_table = db.execute(
                     "SELECT to_regclass('public.scheduled_actions') AS table_name").fetchone()

@@ -10,7 +10,7 @@ import types
 import unittest
 import uuid
 from copy import deepcopy
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     import psycopg  # noqa: F401
@@ -49,11 +49,14 @@ class ScriptedDB:
         elif "INSERT INTO tenant_workspaces" in compact:
             self.saved_workspace = json.loads(params[1])
         elif "INSERT INTO integration_events" in compact:
-            self.current = {"id": 41, "created_at": "2026-09-20T12:00:00+00:00"}
+            self.current = {"cursor": 41, "created_at": "2026-09-20T12:00:00+00:00"}
         return self
 
     def fetchone(self):
         return self.current
+
+    def fetchall(self):
+        return []
 
     def commit(self):
         self.commits += 1
@@ -314,6 +317,54 @@ class IntegrationTests(unittest.TestCase):
                     allow_suspended=allow_suspended,
                 )
             self.assertEqual(caught.exception.code, "account_unavailable")
+
+    def test_webhook_creation_and_testing_require_equipe_even_for_admin(self):
+        admin = {"id": str(uuid.uuid4()), "role": "super_admin",
+                 "organization_id": None}
+        self.handler.management_org = lambda *_args, **_kwargs: self.organization_id
+        for method, payload in (
+                (self.handler.create_webhook, {
+                    "organization_id": self.organization_id, "name": "ERP",
+                    "url": "https://hooks.example.com/pulseflow",
+                    "event_types": ["contact.updated"],
+                }),
+                (self.handler.test_webhook, {
+                    "organization_id": self.organization_id,
+                    "webhook_id": str(uuid.uuid4()),
+                })):
+            db = MagicMock()
+            db.execute.return_value.fetchone.return_value = {"plan": "Base", "status": "active"}
+            with self.subTest(method=method.__name__), self.assertRaises(
+                    integrations.IntegrationAPIError) as caught:
+                method(db, admin, payload)
+            self.assertEqual((caught.exception.code, caught.exception.status),
+                             ("plan_required", 403))
+            db.commit.assert_not_called()
+
+    def test_equipe_webhook_creation_returns_secret_once_and_audits_without_it(self):
+        owner = {"id": str(uuid.uuid4()), "role": "owner",
+                 "organization_id": self.organization_id}
+        webhook = {
+            "id": str(uuid.uuid4()), "name": "ERP", "event_types": ["contact.updated"],
+            "secret": "whsec_test-only", "host": "hooks.example.com",
+        }
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = {"plan": "Equipe", "status": "active"}
+        self.handler.management_org = lambda *_args, **_kwargs: self.organization_id
+        self.handler.audit = MagicMock()
+        with patch.object(integrations.integration_events, "create_endpoint",
+                          return_value=webhook):
+            status, response = self.handler.create_webhook(db, owner, {
+                "organization_id": self.organization_id, "name": "ERP",
+                "url": "https://hooks.example.com/pulseflow",
+                "event_types": ["contact.updated"],
+            })
+        self.assertEqual(status, 201)
+        self.assertEqual(response["webhook"]["secret"], "whsec_test-only")
+        audit_metadata = self.handler.audit.call_args.args[4]
+        self.assertNotIn("secret", audit_metadata)
+        self.assertNotIn("url", audit_metadata)
+        db.commit.assert_called_once()
 
     def test_idempotent_replay_is_scoped_to_key_tenant(self):
         payload = self.valid_contact(phone="11999999999")

@@ -100,6 +100,18 @@ class SecurityTests(unittest.TestCase):
         self.handler.account=lambda *a,**k:auth.public_account({'id':self.org,'status':'active','permissions':{}})
         for value in [{'status':'deleted'},{'plan':'FreeEverything'},{'permissions':{'workspace_read':'yes'}}]:
             with self.assertRaises(auth.RequestError):self.handler.update_account(MagicMock(),self.owner,{'organization_id':self.org,**value})
+    def test_downgrade_pauses_webhooks_and_cancels_their_queue(self):
+        db=MagicMock();admin={'id':str(uuid.uuid4()),'role':'super_admin'}
+        self.handler.account=lambda *a,**k:auth.public_account({
+            'id':self.org,'name':'Conta','status':'active','plan':'Equipe','permissions':{}})
+        self.handler.audit=MagicMock();self.handler.reply=lambda status,value:(status,value)
+        status,response=self.handler.update_account(
+            db,admin,{'organization_id':self.org,'plan':'Base'})
+        self.assertEqual(status,200);self.assertEqual(response['account']['plan'],'Base')
+        sql=[' '.join(call.args[0].split()) for call in db.execute.call_args_list]
+        self.assertTrue(any("UPDATE integration_webhook_endpoints SET status='paused'" in q for q in sql))
+        self.assertTrue(any("UPDATE integration_webhook_deliveries SET status='cancelled'" in q for q in sql))
+        db.commit.assert_called_once()
     def test_password_reset_locks_only_the_token_row(self):
         db=MagicMock();db.execute.return_value.fetchone.return_value=None
         self.handler.rate_limit=lambda *a,**k:None
@@ -115,6 +127,89 @@ class SecurityTests(unittest.TestCase):
         self.assertTrue(wa.valid_signature('secret',raw,signature))
         for value in ['',None,'sha256=bad',signature.upper()]:self.assertFalse(wa.valid_signature('secret',raw,value))
         self.assertFalse(wa.valid_signature('secret',b'tampered',signature))
+    def test_reply_event_contains_only_minimal_reconciliation_fields(self):
+        inbound={'message_id':'wamid.reply-1','phone':'5511999999999','name':'Dado privado',
+            'body':'Conteúdo privado da conversa','occurred_at':self.now}
+        lead={'id':'lead-1','name':'Cliente privado','phone':'5511999999999',
+            'notes':'Nota privada','calls':[{'outcome':'privado'}],
+            'ai':{'memory':'privada'},'automationPaused':True}
+        with patch.object(wa.integration_events,'emit_event',return_value={'id':'event-1'}) as emitted:
+            result=wa.emit_contact_reply_event(object(),self.org,lead,inbound)
+        self.assertEqual(result,{'id':'event-1'})
+        args,kwargs=emitted.call_args
+        self.assertEqual(args[1:4],(self.org,'contact.reply_received','lead-1'))
+        self.assertEqual(args[4],{
+            'contact':{'id':'lead-1','board':'','stage':'','opt_out':False,
+                       'automation_paused':True},
+            'message':{'id':'wamid.reply-1'},
+            'received_at':self.now.astimezone(timezone.utc).isoformat().replace('+00:00','Z')})
+        self.assertEqual(kwargs,{'now':self.now})
+        serialized=json.dumps(args[4])
+        for private in ('Dado privado','Conteúdo privado','Cliente privado','5511999999999',
+                        'Nota privada','privada'):
+            self.assertNotIn(private,serialized)
+    def test_duplicate_meta_delivery_does_not_emit_a_second_reply_event(self):
+        class Cursor:
+            def __init__(self,row=None):self.row=row
+            def fetchone(self):return self.row
+        workspace={'leads':[{'id':'lead-1','name':'Cliente','phone':'5511999999999',
+            'board':'Principal','stage':'new','messages':[],'calls':[]}]}
+        class DB:
+            def __init__(self):self.message_inserts=0;self.commits=0
+            def execute(self,query,params=None):
+                compact=' '.join(query.split())
+                if compact.startswith('SELECT w.* FROM whatsapp_connections'):
+                    return Cursor({'organization_id':self_org,'waba_id':'waba-1',
+                        'phone_number_id':'phone-1','app_secret_enc':'encrypted'})
+                if compact.startswith('INSERT INTO whatsapp_messages'):
+                    self.message_inserts+=1
+                    return Cursor({'id':1} if self.message_inserts==1 else None)
+                if compact.startswith('SELECT state,revision FROM tenant_workspaces'):
+                    return Cursor({'state':workspace,'revision':1})
+                if compact.startswith("SELECT to_regclass('public.scheduled_actions')"):
+                    return Cursor({'table_name':None})
+                return Cursor()
+            def commit(self):self.commits+=1
+        self_org=self.org
+        db=DB();handler=wa.handler.__new__(wa.handler)
+        handler.raw_body=b'authenticated-body';handler.headers={'X-Hub-Signature-256':'sha256='+'0'*64}
+        handler.reply=lambda status,payload,*_args:(status,payload)
+        payload={'object':'whatsapp_business_account','entry':[{'id':'waba-1','changes':[
+            {'field':'messages','value':{'messaging_product':'whatsapp',
+                'metadata':{'phone_number_id':'phone-1'},
+                'contacts':[{'wa_id':'5511999999999','profile':{'name':'Cliente'}}],
+                'messages':[{'id':'wamid.reply-1','from':'5511999999999','type':'text',
+                    'timestamp':str(int(self.now.timestamp())),
+                    'text':{'body':'Mensagem privada'}}]}}]}]}
+        with patch.object(wa,'decrypt',return_value='secret'), \
+                patch.object(wa,'valid_signature',return_value=True), \
+                patch.object(wa,'persist_alert',return_value=True), \
+                patch.object(wa.integration_events,'has_consumers',return_value=True), \
+                patch.object(wa,'emit_contact_reply_event') as emitted:
+            self.assertEqual(handler.handle_webhook(db,self.org,payload)[0],200)
+            self.assertEqual(handler.handle_webhook(db,self.org,payload)[0],200)
+        emitted.assert_called_once()
+        self.assertEqual(db.message_inserts,2)
+        self.assertEqual(db.commits,2)
+    def test_whatsapp_schema_bootstraps_core_before_tenant_tables(self):
+        timeline=[]
+        class DB:
+            def execute(self,query,params=None):timeline.append('sql');return self
+            def commit(self):timeline.append('commit')
+        previous=wa._SCHEMA_READY_FOR
+        wa._SCHEMA_READY_FOR=None
+        try:
+            with patch.dict('os.environ',{'DATABASE_URL':'postgresql://schema-test'},clear=False), \
+                    patch.object(auth,'ensure_schema',side_effect=lambda _db:timeline.append('core')), \
+                    patch.object(wa,'ensure_runtime_schema',side_effect=lambda *_args:timeline.append('runtime')), \
+                    patch.object(wa.integration_events,'ensure_schema',side_effect=lambda _db:timeline.append('events')):
+                wa.ensure_schema(DB())
+        finally:
+            wa._SCHEMA_READY_FOR=previous
+        self.assertEqual(timeline[0],'core')
+        self.assertLess(timeline.index('core'),timeline.index('runtime'))
+        self.assertLess(timeline.index('runtime'),timeline.index('events'))
+        self.assertEqual(timeline[-1],'commit')
     def test_configured_does_not_mean_connected(self):
         self.assertFalse(wa.connection_payload({'status':'active'},self.org)['ready'])
         self.assertFalse(wa.connection_payload({'meta_verified_at':self.now},self.org)['ready'])

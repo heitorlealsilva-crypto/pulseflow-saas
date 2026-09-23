@@ -300,6 +300,71 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(result["alreadyRunning"])
         self.assertFalse(any("INSERT INTO worker_runs" in query for query in db.queries))
 
+    def test_batch_processes_webhooks_after_committing_tenant_work(self):
+        events = []
+
+        class Result:
+            def __init__(self, row=None, rows=None):
+                self.row, self.rows = row, rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class DB:
+            def __init__(self):
+                self.queries = []
+
+            def execute(self, query, params=()):
+                self.queries.append((query, params))
+                events.append("execute")
+                if "pg_try_advisory_lock" in query:
+                    return Result({"acquired": True})
+                if "INSERT INTO worker_runs" in query:
+                    return Result({"id": 8})
+                if "SELECT w.organization_id FROM" in query:
+                    return Result(rows=[])
+                return Result()
+
+            def commit(self):
+                events.append("commit")
+
+            def rollback(self):
+                events.append("rollback")
+
+        def deliver(_db, limit):
+            self.assertEqual(limit, 20)
+            self.assertEqual(events[-1], "commit")
+            events.append("webhooks")
+            return {"claimed": 5, "delivered": 3, "retry": 1,
+                    "dead": 1, "paused": 1}
+
+        db = DB()
+        with patch.object(worker, "ensure_schema"), \
+                patch.object(worker, "ensure_worker_schema"), \
+                patch.object(worker.ai_service, "ensure_schema"), \
+                patch.object(worker, "ensure_runtime_schema"), \
+                patch.object(worker.integration_events, "process_deliveries",
+                             side_effect=deliver), \
+                patch.object(worker.integration_events, "cleanup_history",
+                             return_value={"deliveries": 0, "events": 0}), \
+                patch.object(worker, "process_ai_jobs", return_value={
+                    "completed": 2, "failed": 0, "deferred": 0, "skipped": 0}):
+            result = worker.run_batch(db, self.now)
+
+        self.assertEqual(result["webhookDeliveriesClaimed"], 5)
+        self.assertEqual(result["webhookDeliveriesDelivered"], 3)
+        self.assertEqual(result["webhookDeliveriesRetried"], 1)
+        self.assertEqual(result["webhookDeliveriesDead"], 1)
+        self.assertEqual(result["webhookEndpointsPaused"], 1)
+        final_update = next(
+            (params for query, params in db.queries
+             if "webhook_deliveries_claimed=%s" in query), None)
+        self.assertIsNotNone(final_update)
+        self.assertEqual(final_update[-6:-1], (5, 3, 1, 1, 1))
+
     def test_failed_batch_keeps_a_failed_worker_run(self):
         class Result:
             def __init__(self, row=None):
