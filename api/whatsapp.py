@@ -21,6 +21,8 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+from api.runtime import apply_inbound_response, ensure_schema as ensure_runtime_schema, persist_alert
+
 MAX_BODY = 2_000_000
 DEFAULT_APP_URL = "https://pulseflow-saas-alpha.vercel.app"
 _SCHEMA_READY_FOR = None
@@ -104,6 +106,7 @@ def ensure_schema(db):
     ]
     for statement in statements:
         db.execute(statement)
+    ensure_runtime_schema(db, schema_key)
     db.commit()
     _SCHEMA_READY_FOR = schema_key
 
@@ -518,6 +521,7 @@ class handler(BaseHTTPRequestHandler):
                     return self.reply(403, {"ok": False})
                 values.append(value)
         # Check the entire batch before writing; mismatched tenants never get inserted.
+        accepted_inbound = []
         for value in values:
             contacts = {item.get("wa_id", ""): str(item.get("profile", {}).get("name", ""))[:300] for item in value.get("contacts", [])}
             for message in value.get("messages", []):
@@ -529,10 +533,18 @@ class handler(BaseHTTPRequestHandler):
                 if message.get("group_id") or message.get("recipient_type") == "group":
                     continue
                 body = str(message.get("text", {}).get("body", ""))[:4096] if kind == "text" else f"[{kind}: mídia recebida; visualização ainda indisponível]"
-                db.execute("""INSERT INTO whatsapp_messages(organization_id,wa_message_id,contact_phone,contact_name,direction,message_type,body,status,occurred_at,raw)
+                inserted = db.execute("""INSERT INTO whatsapp_messages(organization_id,wa_message_id,contact_phone,contact_name,direction,message_type,body,status,occurred_at,raw)
                     VALUES(%s,%s,%s,%s,'in',%s,%s,'received',%s,%s::jsonb)
-                    ON CONFLICT(organization_id,wa_message_id) DO NOTHING""",
-                    (organization_id, message_id, phone, contacts.get(message.get("from"), ""), kind, body, occurred_at, json.dumps(message)))
+                    ON CONFLICT(organization_id,wa_message_id) DO NOTHING RETURNING id""",
+                    (organization_id, message_id, phone, contacts.get(message.get("from"), ""), kind, body, occurred_at, json.dumps(message))).fetchone()
+                if inserted:
+                    accepted_inbound.append({
+                        "message_id": message_id,
+                        "phone": phone,
+                        "name": contacts.get(message.get("from"), ""),
+                        "body": body,
+                        "occurred_at": occurred_at,
+                    })
             for event in value.get("statuses", []):
                 status = event.get("status")
                 if status not in ("sent", "delivered", "read", "failed"):
@@ -543,6 +555,48 @@ class handler(BaseHTTPRequestHandler):
                          (%s='sent' AND status='accepted') OR (%s='delivered' AND status IN ('accepted','sent')) OR
                          (%s='read' AND status IN ('accepted','sent','delivered')))""",
                     (status, organization_id, event.get("id", ""), status, status, status, status, status))
+        if accepted_inbound:
+            workspace_row = db.execute("""SELECT state,revision FROM tenant_workspaces
+                WHERE organization_id=%s FOR UPDATE""", (organization_id,)).fetchone()
+            workspace = (workspace_row or {}).get("state") or {}
+            changed = False
+            changed_leads = set()
+            for inbound in accepted_inbound:
+                lead, applied = apply_inbound_response(workspace, **inbound)
+                if not applied:
+                    continue
+                changed = True
+                changed_leads.add(str(lead["id"]))
+                persist_alert(
+                    db, organization_id, workspace,
+                    dedupe_key=f"whatsapp-reply:{inbound['message_id']}",
+                    lead_id=lead["id"], kind="reply",
+                    title=f"Resposta recebida de {str(lead.get('name') or 'Contato')[:120]}",
+                    body=("A cadência foi pausada. Revise a conversa antes do próximo contato."
+                          if lead.get("automationPaused") else
+                          "A resposta foi registrada. A regra desta etapa mantém a cadência ativa."),
+                    at=inbound["occurred_at"], payload={"messageId": inbound["message_id"]})
+            if changed:
+                scheduled_table = db.execute(
+                    "SELECT to_regclass('public.scheduled_actions') AS table_name").fetchone()
+                if scheduled_table and scheduled_table.get("table_name"):
+                    for lead_id in changed_leads:
+                        changed_lead = next((item for item in workspace.get("leads", [])
+                                             if str(item.get("id")) == lead_id), {})
+                        if not changed_lead.get("automationPaused"):
+                            continue
+                        db.execute("""UPDATE scheduled_actions SET status='superseded',updated_at=NOW()
+                            WHERE organization_id=%s AND lead_id=%s AND status='pending_approval'
+                              AND kind<>'appointment'""",
+                            (organization_id, lead_id))
+                encoded = json.dumps(workspace, ensure_ascii=False)
+                if workspace_row:
+                    db.execute("""UPDATE tenant_workspaces SET state=%s::jsonb,
+                        revision=revision+1,updated_at=NOW() WHERE organization_id=%s""",
+                        (encoded, organization_id))
+                else:
+                    db.execute("""INSERT INTO tenant_workspaces(organization_id,state,revision,updated_at)
+                        VALUES(%s,%s::jsonb,1,NOW())""", (organization_id, encoded))
         db.execute("UPDATE whatsapp_connections SET last_event_at=NOW() WHERE organization_id=%s", (organization_id,))
         db.commit()
         return self.reply(200, {"ok": True})

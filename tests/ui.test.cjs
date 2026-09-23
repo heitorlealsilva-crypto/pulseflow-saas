@@ -1,4 +1,4 @@
-const {chromium,request}=require('C:/Users/heito/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const {chromium,request}=require('playwright');
 const assert=require('node:assert/strict');
 (async()=>{
  const browser=await chromium.launch({headless:true,channel:'msedge'});

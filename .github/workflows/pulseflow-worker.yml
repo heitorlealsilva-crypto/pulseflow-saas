@@ -1,0 +1,28 @@
+name: PulseFlow scheduler
+
+on:
+  schedule:
+    # ~1,440 runs/month on a private repository, below the common 2,000 minute allowance.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: pulseflow-production-scheduler
+  cancel-in-progress: false
+
+jobs:
+  prepare-due-actions:
+    if: github.repository == 'heitorlealsilva-crypto/pulseflow-saas'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Carregar o invocador versionado
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Preparar ações vencidas
+        run: python3 scripts/invoke_scheduler.py

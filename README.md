@@ -20,15 +20,17 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 
 No modo manual, cadastrar um número **não conecta nem espelha o WhatsApp**. O sistema prepara a mensagem, abre a conversa no WhatsApp e mantém o acompanhamento. Abrir o WhatsApp não confirma entrega: o vendedor precisa confirmar o que efetivamente enviou. Uma ligação registrada é obrigatória antes do primeiro contato por mensagem; contatos que pediram para não receber mensagens devem permanecer bloqueados.
 
-Agendamentos, cadências e regras de automação organizam as próximas ações. O backend mantém uma fila persistente e idempotente: o trabalhador encontra ações vencidas e as coloca na caixa **Aguardando sua decisão**. O agente prepara uma sugestão para revisão, mas uma tarefa vencida nunca significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
+Agendamentos, cadências e regras de automação organizam as próximas ações. Cada etapa do pipeline pode ter prazo, observadora, operadora em modo de sugestão e uma cadência própria acionada na entrada, no vencimento ou após uma resposta. O backend mantém uma fila persistente e idempotente: o trabalhador encontra ações vencidas e as coloca na caixa **Aguardando sua decisão**. O agente prepara uma sugestão para revisão, mas uma tarefa vencida nunca significa mensagem enviada. Nenhuma simulação deve ser apresentada como conversa, ligação ou entrega real.
 
-O projeto inclui um cron diário compatível com a Vercel Hobby. Esse plano não permite execução mais frequente e não garante precisão dentro da hora; cadências em horas precisam da Vercel Pro ou de um agendador externo chamando `POST /api/worker` com o mesmo `CRON_SECRET`. A fila e as chaves de idempotência continuam as mesmas quando a frequência muda.
+O projeto inclui dois disparadores para a mesma fila: um workflow GitHub Actions chama `POST /api/scheduler` aproximadamente a cada 30 minutos usando um token OIDC efêmero, e o cron diário da Vercel Hobby permanece como contingência em `/api/worker`. Não existe segredo permanente do banco ou do agendador no GitHub. A execução usa trava global, trava uma empresa por vez e nunca repete um POST cujo resultado ficou incerto. GitHub Actions e Vercel podem atrasar; a precisão esperada é uma janela de cerca de 30 minutos, não um SLA por minuto. Consulte `docs/SCHEDULER.md`.
 
 ### Sugestões e inteligência artificial
 
 Cada empresa pode configurar seu agente, tom, objetivo, instruções da observadora, instruções da operadora, retenção de memória e regras na área **Automações**. O sistema registra sinais estruturados das conversas e das notas de ligações confirmadas, sempre dentro do espaço da própria empresa, e usa esses registros para dar contexto às próximas sugestões. Isso é memória operacional por regras, não treinamento dos pesos de um modelo nem aprendizagem cruzada entre clientes.
 
-Os roteiros por nicho e sugestões locais continuam funcionando sem custo de modelo. Quando `OPENAI_API_KEY` está configurada, o vendedor pode solicitar uma análise semântica real dentro da conversa. O backend envia somente contexto limitado e sem telefone/e-mail, não permite armazenamento no provedor, guarda a análise na empresa correta e aplica um limite diário por plano. Transcrição de áudio e interpretação automática de chamadas ainda não estão disponíveis. No pós-venda, o agente é somente observador; o envio operacional permanece bloqueado. Em todos os pipelines, a operadora trabalha em modo `suggest_only`: o vendedor revisa e autoriza qualquer mensagem.
+Os roteiros por nicho e sugestões locais continuam funcionando sem custo de modelo. Quando `OPENAI_API_KEY` está configurada, o vendedor pode solicitar uma análise semântica real dentro da conversa e, se habilitar o aprendizado contínuo, o trabalhador também observa mudanças de etapa, contexto, prazo e respostas com o sistema fechado. O plano Base permite até 3 análises contínuas por dia e o Equipe até 30; as análises manuais e contínuas também respeitam o limite total diário do plano. O backend envia somente contexto limitado e sem telefone/e-mail, não permite armazenamento no provedor, guarda a análise na empresa correta e aplica a retenção configurada. Contatos sem permissão ou com pedido de não contato não são enviados ao modelo.
+
+Quando chega uma resposta oficial, o servidor atualiza o contato, cria um alerta durável e aplica a regra `Pausar ao responder` da etapa. Ao pausar, sugestões automáticas antigas são invalidadas, mas compromissos explicitamente agendados continuam ativos. Transcrição de áudio e interpretação automática de chamadas ainda não estão disponíveis. No pós-venda, o agente é somente observador; o envio operacional permanece bloqueado. Em todos os pipelines, a operadora trabalha em modo `suggest_only`: o vendedor revisa e autoriza qualquer mensagem.
 
 ### Planos e serviços externos
 
@@ -60,6 +62,7 @@ Variáveis de ambiente:
 | `CRON_SECRET` | Segredo com pelo menos 16 caracteres, enviado como `Authorization: Bearer ...` pelo cron ou agendador externo. |
 | `OPENAI_API_KEY` | Chave do projeto OpenAI usada somente pelo backend para analisar conversas. |
 | `OPENAI_MODEL` | Modelo de análise; o padrão é `gpt-5.6-luna`. |
+| `PULSEFLOW_GITHUB_REPOSITORY` | Repositório autorizado a chamar o agendador por OIDC; opcional enquanto permanecer `heitorlealsilva-crypto/pulseflow-saas`. |
 
 Não colocar senhas, tokens ou URLs privadas do banco no JavaScript, no repositório ou em capturas de tela. Trocar a chave de criptografia sem migrar as credenciais existentes impede que elas sejam decifradas. As variáveis administrativas inicializam o administrador; não são uma tela de alteração de senha para usuários existentes.
 
@@ -112,7 +115,7 @@ O webhook passa a armazenar mensagens recebidas após a conexão válida. Não e
 
 ## Publicação e validação
 
-Testes automatizados sem serviços externos: `node --test tests/core.test.mjs` e `python -m unittest discover -s tests -p "test_*.py"`. Os testes de interface em `tests/ui.test.cjs` usam Playwright e o servidor isolado na porta 8788, sem enviar mensagens reais. As capturas geradas ficam fora do Git e da publicação.
+Testes automatizados sem serviços externos: `node --test tests/core.test.mjs` e `python -m unittest discover -s tests -p "test_*.py"`. O fluxo específico de agentes e cadências por etapa fica em `tests/column_automation_ui.test.cjs`. Os testes de interface usam Playwright e o servidor isolado na porta 8788, sem enviar mensagens reais. As capturas geradas ficam fora do Git e da publicação.
 
 O frontend usa HTML, CSS e JavaScript sem bibliotecas de interface externas. Na Vercel, os handlers Python ficam em `api/` e as dependências em `requirements.txt`. Configure as variáveis nos ambientes corretos e use banco separado para previews.
 

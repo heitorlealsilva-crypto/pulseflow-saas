@@ -34,6 +34,7 @@ API_MODULES = {
     "/api/integrations": "api.integrations",
     "/api/whatsapp": "api.whatsapp",
     "/api/worker": "api.worker",
+    "/api/scheduler": "api.scheduler",
     "/api/send-whatsapp": "api.send-whatsapp",
 }
 
