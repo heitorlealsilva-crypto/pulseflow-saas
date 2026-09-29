@@ -100,12 +100,10 @@ class MetaOnboardingTests(unittest.TestCase):
         with patch.dict(os.environ, {**ENV, "META_OAUTH_PKCE_ENABLED": "true"}, clear=True):
             result = meta.start_flow(db, organization_id, user_id, session_hash,
                                      "/settings?tab=whatsapp")
-        parsed = urlparse(result["authorization_url"])
-        query = parse_qs(parsed.query)
-        self.assertEqual(query["state"], [result["state"]])
-        self.assertEqual(query["config_id"], [ENV["META_EMBEDDED_SIGNUP_CONFIG_ID"]])
-        self.assertEqual(query["code_challenge_method"], ["S256"])
-        self.assertNotIn(ENV["META_APP_SECRET"], result["authorization_url"])
+        self.assertNotIn("authorization_url", result)
+        self.assertEqual(result["app_id"], ENV["META_APP_ID"])
+        self.assertEqual(result["config_id"], ENV["META_EMBEDDED_SIGNUP_CONFIG_ID"])
+        self.assertEqual(result["graph_version"], ENV["META_GRAPH_VERSION"])
         self.assertNotIn(ENV["META_WEBHOOK_VERIFY_TOKEN"], json.dumps(result, default=str))
         self.assertEqual(db.flow["organization_id"], organization_id)
         self.assertEqual(db.flow["user_id"], user_id)

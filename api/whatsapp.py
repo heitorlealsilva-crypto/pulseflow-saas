@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import unicodedata
 import urllib.error
 import urllib.request
@@ -29,7 +30,8 @@ DEFAULT_APP_URL = "https://pulseflow-saas-alpha.vercel.app"
 _SCHEMA_READY_FOR = None
 PUBLIC_CONNECTION_FIELDS = ("organization_id", "phone_number_id", "waba_id", "business_number",
                             "graph_version", "status", "connected_at", "updated_at",
-                            "meta_verified_at", "webhook_verified_at", "last_event_at")
+                            "meta_verified_at", "webhook_verified_at", "registered_at",
+                            "token_expires_at", "last_event_at", "platform_managed")
 
 
 class IntegrationError(Exception):
@@ -86,6 +88,11 @@ def ensure_schema(db):
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS meta_verified_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS webhook_verified_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS last_event_at TIMESTAMPTZ",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS platform_managed BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS platform_app_id TEXT",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS registration_pin_enc TEXT",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ALTER COLUMN status SET DEFAULT 'configured'",
         "UPDATE whatsapp_connections SET status='configured' WHERE status='active'",
         "CREATE SEQUENCE IF NOT EXISTS whatsapp_message_revision_seq",
@@ -275,10 +282,16 @@ def send_guard(workspace, payload, latest_inbound=None, now=None):
 
 
 def connection_payload(row, organization_id):
+    platform_managed = bool(row and row.get("platform_managed"))
     credentials_saved = bool(row and row.get("phone_number_id") and row.get("waba_id")
-                             and row.get("access_token_enc") and row.get("app_secret_enc"))
+                             and row.get("access_token_enc")
+                             and (platform_managed or row.get("app_secret_enc")))
     public = {key: row.get(key) for key in PUBLIC_CONNECTION_FIELDS} if credentials_saved else None
-    ready = bool(credentials_saved and row.get("meta_verified_at") and row.get("webhook_verified_at"))
+    token_expiry = timestamp((row or {}).get("token_expires_at"))
+    token_current = not token_expiry or token_expiry > datetime.now(timezone.utc)
+    registered = bool(row and (not platform_managed or row.get("registered_at")))
+    ready = bool(credentials_saved and token_current and registered
+                 and row.get("meta_verified_at") and row.get("webhook_verified_at"))
     encryption_ready = len(os.getenv("PULSEFLOW_ENCRYPTION_KEY", "")) >= 32
     meta_verified = bool(row and row.get("meta_verified_at"))
     webhook_verified = bool(row and row.get("webhook_verified_at"))
@@ -295,8 +308,11 @@ def connection_payload(row, organization_id):
                 "meta_verified": meta_verified,
                 "webhook_verified": webhook_verified,
                 "messages_subscribed": webhook_verified,
+                "phone_registered": registered,
+                "token_current": token_current,
             },
-            "webhook_url": f"{base}/api/whatsapp?action=webhook&organization_id={quote(str(organization_id))}"}
+            "webhook_url": (f"{base}/api/whatsapp?action=webhook" if platform_managed else
+                            f"{base}/api/whatsapp?action=webhook&organization_id={quote(str(organization_id))}")}
 
 
 def graph_call(row, path, method="GET", payload=None):
@@ -423,7 +439,8 @@ class handler(BaseHTTPRequestHandler):
                             webhook_verified_at=NOW(),updated_at=NOW()""")
                         db.execute("""UPDATE whatsapp_connections SET webhook_verified_at=NOW(),
                             status=CASE WHEN meta_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,
-                            updated_at=NOW() WHERE phone_number_id<>''""")
+                            updated_at=NOW() WHERE platform_managed=TRUE
+                            AND meta_verified_at IS NOT NULL AND registered_at IS NOT NULL""")
                         db.commit()
                         return self.reply(200, query["hub.challenge"], "text/plain; charset=utf-8")
                     row = db.execute("""SELECT w.verify_token_hash FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
@@ -525,34 +542,12 @@ class handler(BaseHTTPRequestHandler):
             return self.redirect(self._onboarding_return(return_path, flow["id"], "failed",
                                                         "meta_authorization_cancelled"))
         try:
-            access_token = meta_onboarding.exchange_code(query.get("code", ""), flow)
-            meta_onboarding.remember_authorization(db, flow["id"], access_token,
+            authorization = meta_onboarding.exchange_code(query.get("code", ""), flow)
+            meta_onboarding.remember_authorization(db, flow["id"], authorization,
                                                    "asset_selection_required")
-            assets = meta_onboarding.discover_assets(access_token)
         except meta_onboarding.OnboardingError as error:
-            # Preserve a successfully exchanged token when only asset discovery
-            # failed; the authenticated owner can retry/finalize that flow.
-            if "access_token" in locals():
-                meta_onboarding.remember_authorization(
-                    db, flow["id"], access_token, "asset_selection_required", error.code)
-            else:
-                meta_onboarding.mark_failed(db, flow["id"], error.code)
+            meta_onboarding.mark_failed(db, flow["id"], error.code)
             return self.redirect(self._onboarding_return(return_path, flow["id"], "failed", error.code))
-        if len(assets) == 1:
-            asset = assets[0]
-            try:
-                authorized, token, business_number = meta_onboarding.complete_flow(
-                    db, flow["id"], str(flow["organization_id"]), user["id"], session_hash,
-                    asset["waba_id"], asset["phone_number_id"])
-                meta_onboarding.subscribe_app(token, asset["waba_id"])
-                self.persist_oauth_connection(
-                    db, str(flow["organization_id"]), user, authorized, token,
-                    asset["waba_id"], asset["phone_number_id"], business_number)
-                return self.redirect(self._onboarding_return(return_path, flow["id"], "connected"))
-            except (IntegrationError, meta_onboarding.OnboardingError) as error:
-                meta_onboarding.remember_authorization(
-                    db, flow["id"], access_token, "asset_selection_required", error.code)
-                return self.redirect(self._onboarding_return(return_path, flow["id"], "failed", error.code))
         # Redirect OAuth does not reliably return the selected WABA and phone.
         # The same flow is completed by the first-party UI with the IDs emitted
         # by Meta's Embedded Signup completion event.
@@ -578,8 +573,8 @@ class handler(BaseHTTPRequestHandler):
                 raise meta_onboarding.OnboardingError(
                     "Esta autorização pertence a outra conta.", "oauth_session_mismatch", 403)
             try:
-                access_token = meta_onboarding.exchange_code(payload["code"], flow)
-                meta_onboarding.remember_authorization(db, flow_id, access_token,
+                authorization = meta_onboarding.exchange_code(payload["code"], flow)
+                meta_onboarding.remember_authorization(db, flow_id, authorization,
                                                        "asset_selection_required")
             except meta_onboarding.OnboardingError as error:
                 meta_onboarding.mark_failed(db, flow_id, error.code)
@@ -590,16 +585,32 @@ class handler(BaseHTTPRequestHandler):
         flow, access_token, business_number = meta_onboarding.complete_flow(
             db, flow_id, organization_id, user["id"], session_hash,
             payload.get("waba_id"), payload.get("phone_number_id"))
-        meta_onboarding.subscribe_app(access_token, str(payload.get("waba_id")))
+        waba_id, phone_number_id = str(payload.get("waba_id")), str(payload.get("phone_number_id"))
+        pin = os.getenv("META_REGISTRATION_PIN", "").strip()
+        if not re.fullmatch(r"\d{6}", pin):
+            pin = f"{secrets.randbelow(1_000_000):06d}"
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                   ("wa-phone:" + phone_number_id,))
+        other = db.execute("""SELECT organization_id FROM whatsapp_connections
+            WHERE phone_number_id=%s AND organization_id<>%s""",
+            (phone_number_id, organization_id)).fetchone()
+        if other:
+            raise meta_onboarding.OnboardingError(
+                "Este número já está vinculado a outra conta do PulseFlow.",
+                "phone_already_connected", 409)
+        meta_onboarding.subscribe_app(access_token, waba_id)
+        meta_onboarding.register_phone(access_token, phone_number_id, pin)
         self.persist_oauth_connection(db, organization_id, user, flow, access_token,
-                                      str(payload.get("waba_id")),
-                                      str(payload.get("phone_number_id")), business_number)
+                                      waba_id, phone_number_id, business_number,
+                                      token_expires_at=flow.get("token_expires_at"),
+                                      registration_pin=pin)
         row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
         return self.reply(200, {"ok": True, "flow_id": flow_id,
                                "connection": connection_payload(row, organization_id)})
 
     def persist_oauth_connection(self, db, organization_id, user, flow, access_token,
-                                 waba_id, phone_number_id, business_number):
+                                 waba_id, phone_number_id, business_number,
+                                 token_expires_at=None, registration_pin=None):
         app_secret = os.getenv("META_APP_SECRET", "").strip()
         verify_token = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "").strip()
         if len(app_secret) < 16 or len(verify_token) < 32:
@@ -622,19 +633,24 @@ class handler(BaseHTTPRequestHandler):
         version = meta_onboarding.oauth_config()["graph_version"]
         db.execute("""INSERT INTO whatsapp_connections(
                 organization_id,phone_number_id,waba_id,business_number,access_token_enc,
-                app_secret_enc,verify_token_hash,graph_version,status,meta_verified_at,webhook_verified_at)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                app_secret_enc,verify_token_hash,graph_version,status,platform_managed,platform_app_id,
+                registration_pin_enc,token_expires_at,registered_at,meta_verified_at,webhook_verified_at)
+            VALUES(%s,%s,%s,%s,%s,'',%s,%s,%s,TRUE,%s,%s,%s,NOW(),NOW(),%s)
             ON CONFLICT(organization_id) DO UPDATE SET
                 phone_number_id=EXCLUDED.phone_number_id,waba_id=EXCLUDED.waba_id,
                 business_number=EXCLUDED.business_number,access_token_enc=EXCLUDED.access_token_enc,
-                app_secret_enc=EXCLUDED.app_secret_enc,verify_token_hash=EXCLUDED.verify_token_hash,
-                graph_version=EXCLUDED.graph_version,status=EXCLUDED.status,meta_verified_at=NOW(),
-                webhook_verified_at=EXCLUDED.webhook_verified_at,last_event_at=NULL,updated_at=NOW()""",
+                app_secret_enc='',verify_token_hash=EXCLUDED.verify_token_hash,
+                graph_version=EXCLUDED.graph_version,status=EXCLUDED.status,platform_managed=TRUE,
+                platform_app_id=EXCLUDED.platform_app_id,registration_pin_enc=EXCLUDED.registration_pin_enc,
+                token_expires_at=EXCLUDED.token_expires_at,registered_at=EXCLUDED.registered_at,
+                meta_verified_at=NOW(),webhook_verified_at=EXCLUDED.webhook_verified_at,
+                last_event_at=NULL,updated_at=NOW()""",
             (organization_id, phone_number_id, waba_id, business_number,
              encryption.encrypt(access_token.encode()).decode(),
-             encryption.encrypt(app_secret.encode()).decode(),
              hashlib.sha256(verify_token.encode()).hexdigest(), version,
-             "ready" if webhook_verified_at else "configured", webhook_verified_at))
+             "ready" if webhook_verified_at else "configured", os.getenv("META_APP_ID", "").strip(),
+             encryption.encrypt(registration_pin.encode()).decode() if registration_pin else None,
+             token_expires_at, webhook_verified_at))
         db.execute("""UPDATE meta_onboarding_flows SET status='completed',waba_id=%s,
             phone_number_id=%s,access_token_enc=NULL,code_verifier_enc=NULL,
             completed_at=NOW(),updated_at=NOW() WHERE id=%s""",
@@ -661,11 +677,13 @@ class handler(BaseHTTPRequestHandler):
         other = db.execute("SELECT organization_id FROM whatsapp_connections WHERE phone_number_id=%s AND organization_id<>%s", (phone_id, organization_id)).fetchone()
         if other:
             raise IntegrationError("Este número já está vinculado a outra conta.", "phone_already_connected", 409)
-        db.execute("""INSERT INTO whatsapp_connections(organization_id,phone_number_id,waba_id,business_number,access_token_enc,app_secret_enc,verify_token_hash,graph_version,status)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'configured')
+        db.execute("""INSERT INTO whatsapp_connections(organization_id,phone_number_id,waba_id,business_number,access_token_enc,app_secret_enc,verify_token_hash,graph_version,status,platform_managed)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'configured',FALSE)
             ON CONFLICT(organization_id) DO UPDATE SET phone_number_id=EXCLUDED.phone_number_id,waba_id=EXCLUDED.waba_id,
             business_number=EXCLUDED.business_number,access_token_enc=EXCLUDED.access_token_enc,app_secret_enc=EXCLUDED.app_secret_enc,
             verify_token_hash=EXCLUDED.verify_token_hash,graph_version=EXCLUDED.graph_version,status='configured',
+            platform_managed=FALSE,platform_app_id=NULL,registration_pin_enc=NULL,
+            token_expires_at=NULL,registered_at=NULL,
             meta_verified_at=NULL,
             webhook_verified_at=CASE WHEN whatsapp_connections.verify_token_hash=EXCLUDED.verify_token_hash
                 THEN whatsapp_connections.webhook_verified_at ELSE NULL END,
@@ -699,10 +717,11 @@ class handler(BaseHTTPRequestHandler):
         digest = hashlib.sha256(token.encode()).hexdigest()
         db.execute("""INSERT INTO whatsapp_connections(
                 organization_id,phone_number_id,waba_id,business_number,access_token_enc,app_secret_enc,
-                verify_token_hash,graph_version,status)
-            VALUES(%s,'','','','','',%s,'v23.0','webhook_prepared')
+                verify_token_hash,graph_version,status,platform_managed)
+            VALUES(%s,'','','','','',%s,'v23.0','webhook_prepared',FALSE)
             ON CONFLICT(organization_id) DO UPDATE SET
                 verify_token_hash=EXCLUDED.verify_token_hash,
+                platform_managed=FALSE,platform_app_id=NULL,
                 webhook_verified_at=CASE WHEN whatsapp_connections.verify_token_hash=EXCLUDED.verify_token_hash
                     THEN whatsapp_connections.webhook_verified_at ELSE NULL END,
                 status=CASE WHEN whatsapp_connections.phone_number_id<>'' THEN 'configured' ELSE 'webhook_prepared' END,
@@ -712,40 +731,67 @@ class handler(BaseHTTPRequestHandler):
         return self.reply(200, connection_payload(row, organization_id))
 
     def handle_webhook(self, db, organization_id, payload):
-        organization_id = normalized_uuid(organization_id)
-        if organization_id:
-            row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
-                WHERE w.organization_id=%s AND o.status='active' FOR UPDATE OF w""", (organization_id,)).fetchone()
-        else:
-            entry_ids = {str(entry.get("id")) for entry in payload.get("entry", [])
-                         if isinstance(entry, dict) and entry.get("id")}
-            phone_ids = {str(change.get("value", {}).get("metadata", {}).get("phone_number_id"))
-                         for entry in payload.get("entry", []) if isinstance(entry, dict)
-                         for change in entry.get("changes", []) if isinstance(change, dict)
-                         and change.get("field") == "messages"
-                         and change.get("value", {}).get("metadata", {}).get("phone_number_id")}
-            if len(entry_ids) != 1 or len(phone_ids) != 1:
-                return self.reply(403, {"ok": False})
-            row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
-                WHERE w.waba_id=%s AND w.phone_number_id=%s AND o.status='active' FOR UPDATE OF w""",
-                (entry_ids.pop(), phone_ids.pop())).fetchone()
-            organization_id = normalized_uuid((row or {}).get("organization_id"))
-        if not row or not valid_signature(decrypt(row["app_secret_enc"]), getattr(self, "raw_body", b""), self.headers.get("X-Hub-Signature-256", "")):
-            return self.reply(401, {"ok": False})
         if payload.get("object") != "whatsapp_business_account" or not isinstance(payload.get("entry"), list):
             return self.reply(400, {"ok": False})
-        values = []
-        for entry in payload["entry"]:
-            if not isinstance(entry, dict) or str(entry.get("id")) != row["waba_id"]:
-                return self.reply(403, {"ok": False})
-            for change in entry.get("changes", []):
-                if change.get("field") != "messages":
-                    continue
-                value = change.get("value", {})
-                if value.get("messaging_product") != "whatsapp" or str(value.get("metadata", {}).get("phone_number_id")) != row["phone_number_id"]:
+        requested_org = normalized_uuid(organization_id)
+        groups = {}
+        if requested_org:
+            row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
+                WHERE w.organization_id=%s AND w.platform_managed=FALSE AND o.status='active'""",
+                (requested_org,)).fetchone()
+            if (not row or not row.get("app_secret_enc") or
+                    not valid_signature(decrypt(row["app_secret_enc"]), getattr(self, "raw_body", b""),
+                                        self.headers.get("X-Hub-Signature-256", ""))):
+                return self.reply(401, {"ok": False})
+            values = []
+            for entry in payload["entry"]:
+                if not isinstance(entry, dict) or str(entry.get("id")) != row["waba_id"]:
                     return self.reply(403, {"ok": False})
-                values.append(value)
-        # Check the entire batch before writing; mismatched tenants never get inserted.
+                for change in entry.get("changes", []):
+                    if not isinstance(change, dict) or change.get("field") != "messages":
+                        continue
+                    value = change.get("value", {})
+                    if (not isinstance(value, dict) or value.get("messaging_product") != "whatsapp"
+                            or str(value.get("metadata", {}).get("phone_number_id")) != row["phone_number_id"]):
+                        return self.reply(403, {"ok": False})
+                    values.append(value)
+            groups[(row["waba_id"], row["phone_number_id"])] = (row, values)
+        else:
+            app_secret = os.getenv("META_APP_SECRET", "").strip()
+            if (len(app_secret) < 16 or
+                    not valid_signature(app_secret, getattr(self, "raw_body", b""),
+                                        self.headers.get("X-Hub-Signature-256", ""))):
+                return self.reply(401, {"ok": False})
+            pending = {}
+            for entry in payload["entry"]:
+                if not isinstance(entry, dict) or not re.fullmatch(r"\d{5,30}", str(entry.get("id", ""))):
+                    return self.reply(403, {"ok": False})
+                waba_id = str(entry["id"])
+                for change in entry.get("changes", []):
+                    if not isinstance(change, dict) or change.get("field") != "messages":
+                        continue
+                    value = change.get("value", {})
+                    phone_id = str((value.get("metadata") or {}).get("phone_number_id", "")) if isinstance(value, dict) else ""
+                    if (not isinstance(value, dict) or value.get("messaging_product") != "whatsapp"
+                            or not re.fullmatch(r"\d{5,30}", phone_id)):
+                        return self.reply(403, {"ok": False})
+                    pending.setdefault((waba_id, phone_id), []).append(value)
+            # Resolve every tenant before writing anything. One signed Meta batch
+            # may legitimately contain events for several customer accounts.
+            for key in sorted(pending):
+                row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o
+                    ON o.id=w.organization_id WHERE w.waba_id=%s AND w.phone_number_id=%s
+                    AND w.platform_managed=TRUE AND o.status='active'""", key).fetchone()
+                if not row:
+                    return self.reply(403, {"ok": False})
+                groups[key] = (row, pending[key])
+        for row, values in groups.values():
+            self.process_webhook_values(db, row, values)
+        db.commit()
+        return self.reply(200, {"ok": True})
+
+    def process_webhook_values(self, db, row, values):
+        organization_id = str(row["organization_id"])
         accepted_inbound = []
         for value in values:
             contacts = {item.get("wa_id", ""): str(item.get("profile", {}).get("name", ""))[:300] for item in value.get("contacts", [])}
@@ -826,13 +872,11 @@ class handler(BaseHTTPRequestHandler):
                     db.execute("""INSERT INTO tenant_workspaces(organization_id,state,revision,updated_at)
                         VALUES(%s,%s::jsonb,1,NOW())""", (organization_id, encoded))
         db.execute("UPDATE whatsapp_connections SET last_event_at=NOW() WHERE organization_id=%s", (organization_id,))
-        db.commit()
-        return self.reply(200, {"ok": True})
 
     def send_message(self, db, organization_id, payload, user):
         row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s FOR SHARE", (organization_id,)).fetchone()
-        if not row or not row.get("meta_verified_at") or not row.get("webhook_verified_at"):
-            raise IntegrationError("Valide as credenciais e o webhook da Meta antes de enviar.", "connection_not_ready", 409)
+        if not row or not connection_payload(row, organization_id)["ready"]:
+            raise IntegrationError("Conclua a validação do número, token e webhook da Meta antes de enviar.", "connection_not_ready", 409)
         workspace_row = db.execute("SELECT state FROM tenant_workspaces WHERE organization_id=%s FOR SHARE", (organization_id,)).fetchone()
         workspace = (workspace_row or {}).get("state") or {}
         lead = next((item for item in workspace.get("leads", []) if str(item.get("id")) == str(payload.get("lead_id", ""))), {})

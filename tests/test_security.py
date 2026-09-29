@@ -200,22 +200,23 @@ class SecurityTests(unittest.TestCase):
             def execute(self,query,params=None):
                 compact=' '.join(query.split());self.calls.append((compact,params))
                 if compact.startswith('SELECT w.* FROM whatsapp_connections'):
-                    return Cursor({'organization_id':self_org,'waba_id':'waba-1',
-                        'phone_number_id':'phone-2','app_secret_enc':'encrypted'})
+                    return Cursor({'organization_id':self_org,'waba_id':'123456789012345',
+                        'phone_number_id':'234567890123456','app_secret_enc':'',
+                        'platform_managed':True})
                 return Cursor()
             def commit(self):pass
         self_org=self.org;db=DB();handler=wa.handler.__new__(wa.handler)
         handler.raw_body=b'body';handler.headers={'X-Hub-Signature-256':'sha256='+'0'*64}
         handler.reply=lambda status,payload,*_args:(status,payload)
-        payload={'object':'whatsapp_business_account','entry':[{'id':'waba-1','changes':[
+        payload={'object':'whatsapp_business_account','entry':[{'id':'123456789012345','changes':[
             {'field':'messages','value':{'messaging_product':'whatsapp',
-                'metadata':{'phone_number_id':'phone-2'},'messages':[],'statuses':[]}}]}]}
-        with patch.object(wa,'decrypt',return_value='secret'), \
+                'metadata':{'phone_number_id':'234567890123456'},'messages':[],'statuses':[]}}]}]}
+        with patch.dict('os.environ',{'META_APP_SECRET':'server-meta-secret-1234567890'},clear=False), \
                 patch.object(wa,'valid_signature',return_value=True):
             self.assertEqual(handler.handle_webhook(db,'',payload)[0],200)
         route=next(params for query,params in db.calls
                    if query.startswith('SELECT w.* FROM whatsapp_connections'))
-        self.assertEqual(route,('waba-1','phone-2'))
+        self.assertEqual(route,('123456789012345','234567890123456'))
     def test_whatsapp_schema_bootstraps_core_before_tenant_tables(self):
         timeline=[]
         class DB:
@@ -244,7 +245,8 @@ class SecurityTests(unittest.TestCase):
         with patch.dict('os.environ',{'PULSEFLOW_ENCRYPTION_KEY':'test-only-key-not-for-production-12345'}):
             value=wa.connection_payload({'phone_number_id':'12345','waba_id':'67890','access_token_enc':'x','app_secret_enc':'y','meta_verified_at':self.now},self.org)
         self.assertEqual(value['setup'],{'server_ready':True,'credentials_saved':True,
-            'meta_verified':True,'webhook_verified':False,'messages_subscribed':False})
+            'meta_verified':True,'webhook_verified':False,'messages_subscribed':False,
+            'phone_registered':True,'token_current':True})
     def test_prepared_webhook_is_not_reported_as_credentials(self):
         value=wa.connection_payload({'verify_token_hash':'secret','webhook_verified_at':self.now},self.org)
         self.assertFalse(value['configured']);self.assertTrue(value['webhook_prepared']);self.assertFalse(value['ready'])

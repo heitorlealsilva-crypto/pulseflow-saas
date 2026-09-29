@@ -1,9 +1,10 @@
 """Server-side Meta OAuth/Embedded Signup primitives.
 
-The browser receives only public application identifiers and a short-lived
-authorization URL.  App secrets, authorization codes, access tokens and PKCE
+The browser receives only public application identifiers and a short-lived,
+single-use state.  App secrets, authorization codes, access tokens and PKCE
 verifiers never become tenant workspace data and are never returned by status
-endpoints.
+endpoints.  WABA and phone identifiers come from Meta's
+``WA_EMBEDDED_SIGNUP`` browser event and are verified again on the server.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 MAX_PROVIDER_BODY = 1_000_000
 FLOW_TTL = timedelta(minutes=10)
+GRAPH_ID_PATTERN = re.compile(r"[0-9]{5,30}")
 
 
 class OnboardingError(Exception):
@@ -134,11 +136,12 @@ def ensure_schema(db):
             return_path TEXT NOT NULL DEFAULT '/', code_verifier_enc TEXT,
             access_token_enc TEXT, waba_id TEXT, phone_number_id TEXT,
             status TEXT NOT NULL DEFAULT 'pending', error_code TEXT,
-            expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ,
+            expires_at TIMESTAMPTZ NOT NULL, token_expires_at TIMESTAMPTZ, used_at TIMESTAMPTZ,
             authorized_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
         "CREATE INDEX IF NOT EXISTS meta_onboarding_org_idx ON meta_onboarding_flows(organization_id,created_at DESC)",
         "CREATE INDEX IF NOT EXISTS meta_onboarding_expiry_idx ON meta_onboarding_flows(expires_at)",
+        "ALTER TABLE meta_onboarding_flows ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ",
         """CREATE TABLE IF NOT EXISTS meta_app_configuration (
             singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK(singleton),
             webhook_verified_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
@@ -181,6 +184,27 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _graph_id(value, error_code="meta_assets_missing"):
+    normalized = str(value or "").strip()
+    if not GRAPH_ID_PATTERN.fullmatch(normalized):
+        raise OnboardingError("A Meta não informou um identificador válido.", error_code, 409)
+    return normalized
+
+
+def _access_token(value):
+    if (not isinstance(value, str) or not 16 <= len(value) <= 8192
+            or any(ord(char) < 33 or ord(char) > 126 for char in value)):
+        raise OnboardingError("A credencial devolvida pela Meta é inválida.",
+                              "invalid_meta_access_token", 400)
+    return value
+
+
+def _provider_text(value, limit):
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if ord(char) >= 32 and char != "\x7f")[:limit]
+
+
 def start_flow(db, organization_id, user_id, session_hash, return_url="/"):
     if not session_hash:
         raise OnboardingError("Entre novamente antes de conectar a Meta.", "unauthenticated", 401)
@@ -203,20 +227,9 @@ def start_flow(db, organization_id, user_id, session_hash, return_url="/"):
     flow_id = str(uuid.uuid4())
     state = secrets.token_urlsafe(32)
     verifier, verifier_enc = None, None
-    params = {
-        "client_id": config["app_id"],
-        "redirect_uri": config["redirect_uri"],
-        "state": state,
-        "response_type": "code",
-        "config_id": config["config_id"],
-        "override_default_response_type": "true",
-    }
     if config["pkce_enabled"]:
         verifier = secrets.token_urlsafe(64)
         verifier_enc = encrypt_private(verifier)
-        params.update(code_challenge=base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode(),
-            code_challenge_method="S256")
     expires_at = _now() + FLOW_TTL
     db.execute("""INSERT INTO meta_onboarding_flows(
         id,organization_id,user_id,session_hash,state_hash,return_path,code_verifier_enc,expires_at)
@@ -224,10 +237,13 @@ def start_flow(db, organization_id, user_id, session_hash, return_url="/"):
         (flow_id, organization_id, user_id, session_hash, hashlib.sha256(state.encode()).hexdigest(),
          safe_return_path(return_url), verifier_enc, expires_at))
     db.commit()
-    url = f"https://www.facebook.com/{config['graph_version']}/dialog/oauth?{urlencode(params)}"
-    return {"authorization_url": url, "flow_id": flow_id, "state": state,
-            "expires_at": expires_at, "app_id": config["app_id"],
-            "config_id": config["config_id"], "pkce_enabled": config["pkce_enabled"]}
+    # The first-party UI starts Facebook Login for Business through the
+    # official JavaScript SDK.  It does not need an OAuth URL assembled by the
+    # server.  WABA/phone IDs are posted back only after WA_EMBEDDED_SIGNUP.
+    return {"flow_id": flow_id, "state": state, "expires_at": expires_at,
+            "app_id": config["app_id"], "config_id": config["config_id"],
+            "graph_version": config["graph_version"],
+            "pkce_enabled": config["pkce_enabled"]}
 
 
 def consume_state(db, state, session_hash):
@@ -277,90 +293,104 @@ def exchange_code(code, flow):
         data=urlencode(fields).encode(), method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
     result = _provider_json(request)
-    token = result.get("access_token")
-    if not isinstance(token, str) or not 16 <= len(token) <= 8192:
+    try:
+        token = _access_token(result.get("access_token"))
+    except OnboardingError:
         raise OnboardingError("A Meta não devolveu uma credencial utilizável.", "meta_invalid_response", 502)
-    return token
+    expires_in = result.get("expires_in")
+    expires_at = None
+    if expires_in is not None:
+        if (isinstance(expires_in, bool)
+                or not isinstance(expires_in, (int, float, str))
+                or not str(expires_in).isdigit()):
+            raise OnboardingError("A Meta devolveu uma validade inválida.",
+                                  "meta_invalid_response", 502)
+        seconds = int(expires_in)
+        if not 1 <= seconds <= 315_360_000:
+            raise OnboardingError("A Meta devolveu uma validade inválida.",
+                                  "meta_invalid_response", 502)
+        expires_at = _now() + timedelta(seconds=seconds)
+    return {"access_token": token, "expires_at": expires_at}
 
 
-def graph_call(access_token, path, method="GET"):
+def graph_call(access_token, path, method="GET", json_body=None):
     config = oauth_config()
-    if not isinstance(path, str) or not path or path.startswith(("http://", "https://")):
+    token = _access_token(access_token)
+    if (not isinstance(path, str) or not path or len(path) > 2000
+            or path.startswith(("/", "http://", "https://"))
+            or not re.fullmatch(r"[A-Za-z0-9._~/%?&=,+-]+", path)
+            or any(part == ".." for part in path.split("/"))):
         raise OnboardingError("Consulta inválida à Meta.", "meta_invalid_request", 500)
+    normalized_method = str(method or "").upper()
+    if normalized_method not in ("GET", "POST"):
+        raise OnboardingError("Operação inválida na Meta.", "meta_invalid_request", 500)
+    if json_body is not None and normalized_method != "POST":
+        raise OnboardingError("Operação inválida na Meta.", "meta_invalid_request", 500)
+    data = None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if json_body is not None:
+        if not isinstance(json_body, dict):
+            raise OnboardingError("Conteúdo inválido para a Meta.", "meta_invalid_request", 500)
+        data = json.dumps(json_body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif normalized_method == "POST":
+        data = b""
     request = urllib.request.Request(
-        f"https://graph.facebook.com/{config['graph_version']}/{path}", method=method,
-        data=b"" if method == "POST" else None,
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"})
+        f"https://graph.facebook.com/{config['graph_version']}/{path}",
+        method=normalized_method, data=data, headers=headers)
     return _provider_json(request)
 
 
-def discover_assets(access_token):
-    """Return visible WABA/phone pairs without guessing an association.
-
-    Embedded Signup deployments can pin ``META_BUSINESS_ID``.  Otherwise we
-    enumerate only businesses explicitly visible to the short-lived token.
-    An empty or ambiguous result is left for the UI to resolve; it is never
-    silently attached to a tenant.
-    """
-    configured_business = os.getenv("META_BUSINESS_ID", "").strip()
-    if configured_business:
-        if not re.fullmatch(r"\d{5,30}", configured_business):
-            raise OnboardingError("O identificador empresarial da Meta está inválido.",
-                                  "meta_configuration_invalid")
-        business_ids = [configured_business]
-    else:
-        businesses = graph_call(access_token, "me/businesses?fields=id&limit=100")
-        business_ids = [str(item.get("id")) for item in businesses.get("data", [])
-                        if re.fullmatch(r"\d{5,30}", str(item.get("id", "")))][:100]
-    wabas = {}
-    for business_id in business_ids:
-        for edge in ("owned_whatsapp_business_accounts", "client_whatsapp_business_accounts"):
-            try:
-                result = graph_call(access_token, f"{business_id}/{edge}?fields=id,name&limit=100")
-            except OnboardingError as error:
-                if error.code == "meta_authorization_rejected":
-                    continue
-                raise
-            for item in result.get("data", []):
-                value = str(item.get("id", ""))
-                if re.fullmatch(r"\d{5,30}", value):
-                    wabas[value] = str(item.get("name") or "")[:200]
-    assets = []
-    for waba_id, waba_name in list(wabas.items())[:100]:
-        phones = graph_call(access_token,
-                            f"{waba_id}/phone_numbers?fields=id,display_phone_number,verified_name&limit=100")
-        for phone in phones.get("data", []):
-            phone_id = str(phone.get("id", ""))
-            if re.fullmatch(r"\d{5,30}", phone_id):
-                assets.append({"waba_id": waba_id, "waba_name": waba_name,
-                               "phone_number_id": phone_id,
-                               "display_phone_number": str(phone.get("display_phone_number") or "")[:40],
-                               "verified_name": str(phone.get("verified_name") or "")[:200]})
-    return assets
-
-
 def validate_assets(access_token, waba_id, phone_number_id):
-    if not re.fullmatch(r"\d{5,30}", str(waba_id or "")) or not re.fullmatch(r"\d{5,30}", str(phone_number_id or "")):
-        raise OnboardingError("A Meta não informou uma conta e um número válidos.", "meta_assets_missing", 409)
-    phone = graph_call(access_token, f"{phone_number_id}?fields=id,display_phone_number")
-    phones = graph_call(access_token, f"{waba_id}/phone_numbers?fields=id,display_phone_number&limit=100")
-    match = next((item for item in phones.get("data", [])
-                  if str(item.get("id")) == str(phone_number_id)), None)
-    if str(phone.get("id")) != str(phone_number_id) or not match:
+    waba = _graph_id(waba_id)
+    phone_id = _graph_id(phone_number_id)
+    phone = graph_call(access_token, f"{phone_id}?fields=id,display_phone_number")
+    phones = graph_call(access_token,
+                        f"{waba}/phone_numbers?fields=id,display_phone_number&limit=100")
+    values = phones.get("data")
+    if not isinstance(values, list):
+        raise OnboardingError("A Meta retornou uma lista de números inválida.",
+                              "meta_invalid_response", 502)
+    match = next((item for item in values if isinstance(item, dict)
+                  and str(item.get("id")) == phone_id), None)
+    if str(phone.get("id")) != phone_id or not match:
         raise OnboardingError("O número escolhido não pertence à conta WhatsApp autorizada.", "meta_account_mismatch", 409)
-    return str(phone.get("display_phone_number") or match.get("display_phone_number") or "")[:40]
+    return _provider_text(phone.get("display_phone_number")
+                          or match.get("display_phone_number"), 40)
 
 
 def subscribe_app(access_token, waba_id):
-    result = graph_call(access_token, f"{waba_id}/subscribed_apps", "POST")
+    waba = _graph_id(waba_id)
+    result = graph_call(access_token, f"{waba}/subscribed_apps", "POST")
     if result.get("success") is not True:
         raise OnboardingError("A conta foi autorizada, mas a Meta não confirmou o webhook.", "meta_subscription_failed", 502)
+    return True
 
 
-def remember_authorization(db, flow_id, access_token, status="authorized", error_code=None):
+def register_phone(access_token, phone_number_id, pin):
+    phone_id = _graph_id(phone_number_id)
+    normalized_pin = str(pin or "")
+    if not re.fullmatch(r"[0-9]{6}", normalized_pin):
+        raise OnboardingError("Informe um PIN numérico de 6 dígitos.",
+                              "invalid_registration_pin", 400)
+    result = graph_call(access_token, f"{phone_id}/register", "POST", {
+        "messaging_product": "whatsapp",
+        "pin": normalized_pin,
+    })
+    if result.get("success") is not True:
+        raise OnboardingError("A Meta não confirmou o registro do número.",
+                              "meta_phone_registration_failed", 502)
+    return True
+
+
+def remember_authorization(db, flow_id, access_token, status="authorized", error_code=None,
+                           expires_at=None):
+    if isinstance(access_token, dict):
+        expires_at = access_token.get("expires_at", expires_at)
+        access_token = access_token.get("access_token")
     db.execute("""UPDATE meta_onboarding_flows SET access_token_enc=%s,status=%s,error_code=%s,
-        authorized_at=NOW(),code_verifier_enc=NULL,updated_at=NOW() WHERE id=%s""",
-        (encrypt_private(access_token), status, error_code, flow_id))
+        token_expires_at=%s,authorized_at=NOW(),code_verifier_enc=NULL,updated_at=NOW() WHERE id=%s""",
+        (encrypt_private(_access_token(access_token)), status, error_code, expires_at, flow_id))
     db.commit()
 
 
@@ -382,6 +412,8 @@ def complete_flow(db, flow_id, organization_id, user_id, session_hash, waba_id, 
         raise OnboardingError("A autorização não está disponível para conclusão.", "onboarding_not_authorized", 409)
     if row.get("expires_at") and row["expires_at"] <= _now():
         raise OnboardingError("A autorização expirou. Comece novamente.", "onboarding_expired", 409)
+    if row.get("token_expires_at") and row["token_expires_at"] <= _now():
+        raise OnboardingError("A credencial da Meta expirou. Comece novamente.", "meta_token_expired", 409)
     token = decrypt_private(row["access_token_enc"])
     business_number = validate_assets(token, str(waba_id), str(phone_number_id))
     return row, token, business_number

@@ -111,16 +111,16 @@ O consumo incremental de `events` continua disponível como reconciliação conf
 
 ## Integrar o WhatsApp oficial
 
-A integração usa a WhatsApp Cloud API e depende de um aplicativo Meta configurado, conta WhatsApp Business, número habilitado e permissões válidas. A verificação do cadastro de desenvolvedor e do número deve ser concluída na Meta pelo titular da conta.
+A integração usa a WhatsApp Cloud API e depende de um aplicativo Meta configurado, uma configuração do Facebook Login for Business (Embedded Signup), conta WhatsApp Business, número habilitado e permissões válidas. O cadastro de desenvolvedor, a verificação empresarial e a aprovação do aplicativo devem ser concluídos na Meta pelo titular da plataforma. O cliente final não precisa digitar o App Secret nem o token da plataforma.
 
-Na configuração do WhatsApp da empresa, informar o identificador do número, o identificador da conta comercial, o token de acesso autorizado, o segredo do aplicativo e um token de verificação de webhook. Usar o endereço de webhook mostrado pelo sistema na configuração da Meta e assinar o evento de mensagens.
+No Vercel, configure somente no ambiente **Production**: `META_APP_ID`, `META_APP_SECRET`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, `META_WEBHOOK_VERIFY_TOKEN` (pelo menos 32 caracteres), `PULSEFLOW_ENCRYPTION_KEY` (pelo menos 32 caracteres), `PULSEFLOW_APP_URL` e, opcionalmente, `META_GRAPH_VERSION` e `META_REGISTRATION_PIN`. A configuração do Facebook Login for Business deve incluir o domínio publicado em Allowed Domains e Valid OAuth Redirect URIs. O callback global do webhook é `/api/whatsapp?action=webhook`; o token de verificação é o mesmo valor de `META_WEBHOOK_VERIFY_TOKEN`.
 
-Para o fluxo recomendado de SaaS, o proprietário usa **Conectar com a Meta**. O backend cria um `state` de uso único vinculado à sessão, usuário e empresa, troca o código OAuth no servidor, confirma que o número pertence à WABA autorizada e cifra a credencial antes de persistir. O segredo do aplicativo, token de webhook, código OAuth, token de acesso e eventual verificador PKCE nunca fazem parte do workspace nem das respostas de status. O callback só redireciona para um caminho interno previamente validado.
+Para o fluxo recomendado de SaaS, o proprietário usa **Conectar com a Meta**. O SDK oficial abre o Embedded Signup, devolve um código de uso curto e um evento `WA_EMBEDDED_SIGNUP` com WABA e número escolhidos. O backend cria um `state` de uso único vinculado à sessão, usuário e empresa, troca o código no servidor, confirma que o número pertence à WABA autorizada, assina o webhook da WABA, registra o número com PIN de seis dígitos e cifra a credencial antes de persistir. O segredo do aplicativo, token de webhook, código OAuth, token de acesso, PIN e eventual verificador PKCE nunca fazem parte do workspace nem das respostas de status.
 
 - `GET /api/whatsapp?action=connection`: estado da conexão, sem revelar credenciais.
 - `GET /api/whatsapp?action=onboarding-status`: disponibilidade da configuração e último fluxo da sessão, sem segredos.
-- `POST /api/whatsapp?action=onboarding-start`: inicia a autorização para a empresa autenticada e devolve a URL oficial da Meta.
-- `GET|POST /api/whatsapp?action=onboarding-callback`: consome uma única vez o retorno OAuth/Embedded Signup e associa WABA e número confirmados.
+- `POST /api/whatsapp?action=onboarding-start`: inicia um estado de autorização para a empresa autenticada e devolve somente identificadores públicos para o SDK.
+- `GET|POST /api/whatsapp?action=onboarding-callback`: consome uma única vez o código OAuth e o evento Embedded Signup, associa WABA e número confirmados e registra o número.
 - `GET /api/whatsapp?action=messages`: mensagens da empresa autenticada.
 - `POST /api/whatsapp?action=connect`: salva a configuração cifrada.
 - `POST /api/whatsapp?action=validate`: verifica a configuração no provedor.
@@ -128,7 +128,7 @@ Para o fluxo recomendado de SaaS, o proprietário usa **Conectar com a Meta**. O
 - `GET|POST /api/whatsapp?action=webhook`: verificação e recebimento de eventos com validação de assinatura.
 - `/api/send-whatsapp`: endpoint legado desativado; não utilizar.
 
-O webhook passa a armazenar mensagens recebidas após a conexão válida. Não existe importação geral do histórico antigo, espelhamento de qualquer grupo do aplicativo ou conexão por QR Code não oficial. Envios fora das condições aceitas pela Meta devem ser bloqueados; suporte a templates aprovados depende dos tipos de envio realmente implementados no handler.
+O webhook global valida a assinatura da Meta e localiza a empresa pelo par WABA/Phone Number ID; isso mantém o isolamento entre clientes mesmo quando uma entrega contém vários eventos. Ele passa a armazenar mensagens recebidas após a conexão válida. Não existe importação geral do histórico antigo, espelhamento de grupos do aplicativo ou conexão por QR Code não oficial. Envios fora das condições aceitas pela Meta devem ser bloqueados; suporte a templates aprovados depende dos tipos de envio realmente implementados no handler.
 
 ## Publicação e validação
 
