@@ -24,6 +24,14 @@ const assert=require('node:assert/strict');
   await page.locator('#modal').waitFor({state:'detached'});
  }
 
+ const me=await page.evaluate(()=>fetch('/api/auth?action=me').then(response=>response.json()));
+ const adminApi=await request.newContext({baseURL:'http://127.0.0.1:8788'});
+ await adminApi.post('/api/auth?action=login',{headers:{Origin:'http://127.0.0.1:8788'},data:{email:'admin@example.test',password:'PulseFlow-local-2026!'}});
+ const resetPlan=await adminApi.post('/api/auth?action=admin-account',{headers:{Origin:'http://127.0.0.1:8788'},data:{organization_id:me.account.id,plan:'Base'}});
+ assert.equal(resetPlan.status(),200);
+ await page.reload();
+ await page.locator('.sidebar').waitFor();
+
  await page.locator('.sidebar [data-page=settings]').click();
  const metaStatusResponse=page.waitForResponse(response=>response.url().includes('action=onboarding-status'));
  await page.locator('[data-settings=channel]').click();
@@ -53,9 +61,6 @@ const assert=require('node:assert/strict');
  await loaded;
  assert.equal(await page.locator('#outbound-webhooks-panel').count(),0,'Plano Base sem destinos não deve exibir webhooks avançados.');
 
- const me=await page.evaluate(()=>fetch('/api/auth?action=me').then(response=>response.json()));
- const adminApi=await request.newContext({baseURL:'http://127.0.0.1:8788'});
- await adminApi.post('/api/auth?action=login',{headers:{Origin:'http://127.0.0.1:8788'},data:{email:'admin@example.test',password:'PulseFlow-local-2026!'}});
  const upgrade=await adminApi.post('/api/auth?action=admin-account',{headers:{Origin:'http://127.0.0.1:8788'},data:{organization_id:me.account.id,plan:'Equipe'}});
  assert.equal(upgrade.status(),200);
  await adminApi.dispose();
