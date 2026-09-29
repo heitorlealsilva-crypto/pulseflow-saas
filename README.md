@@ -59,6 +59,12 @@ Variáveis de ambiente:
 | `PULSEFLOW_ADMIN_PASSWORD` | Senha forte do administrador inicial, fornecida como segredo no servidor. |
 | `PULSEFLOW_ENCRYPTION_KEY` | Segredo com pelo menos 32 caracteres para proteger credenciais WhatsApp, URLs e segredos dos webhooks de saída. Manter backup seguro. |
 | `META_GRAPH_VERSION` | Versão da Graph API adotada pela integração, quando configurada. |
+| `META_APP_ID` | Identificador público do aplicativo Meta usado pelo Cadastro Incorporado. |
+| `META_APP_SECRET` | Segredo do aplicativo Meta, usado somente no servidor para trocar o código OAuth e validar webhooks. |
+| `META_EMBEDDED_SIGNUP_CONFIG_ID` | Identificador da configuração Facebook Login for Business/Embedded Signup. |
+| `META_WEBHOOK_VERIFY_TOKEN` | Segredo global de ao menos 32 caracteres usado para verificar o callback compartilhado do aplicativo. |
+| `META_OAUTH_REDIRECT_URI` | Opcional; deve ser exatamente o callback HTTPS do PulseFlow. O padrão é `/api/whatsapp?action=onboarding-callback` na URL pública. |
+| `META_OAUTH_PKCE_ENABLED` | Ativa PKCE S256 apenas quando a configuração Meta utilizada aceitar o parâmetro; permanece desativado por padrão. |
 | `CRON_SECRET` | Segredo com pelo menos 16 caracteres, enviado como `Authorization: Bearer ...` pelo cron ou agendador externo. |
 | `OPENAI_API_KEY` | Chave do projeto OpenAI usada somente pelo backend para analisar conversas. |
 | `OPENAI_MODEL` | Modelo de análise; o padrão é `gpt-5.6-luna`. |
@@ -109,7 +115,12 @@ A integração usa a WhatsApp Cloud API e depende de um aplicativo Meta configur
 
 Na configuração do WhatsApp da empresa, informar o identificador do número, o identificador da conta comercial, o token de acesso autorizado, o segredo do aplicativo e um token de verificação de webhook. Usar o endereço de webhook mostrado pelo sistema na configuração da Meta e assinar o evento de mensagens.
 
+Para o fluxo recomendado de SaaS, o proprietário usa **Conectar com a Meta**. O backend cria um `state` de uso único vinculado à sessão, usuário e empresa, troca o código OAuth no servidor, confirma que o número pertence à WABA autorizada e cifra a credencial antes de persistir. O segredo do aplicativo, token de webhook, código OAuth, token de acesso e eventual verificador PKCE nunca fazem parte do workspace nem das respostas de status. O callback só redireciona para um caminho interno previamente validado.
+
 - `GET /api/whatsapp?action=connection`: estado da conexão, sem revelar credenciais.
+- `GET /api/whatsapp?action=onboarding-status`: disponibilidade da configuração e último fluxo da sessão, sem segredos.
+- `POST /api/whatsapp?action=onboarding-start`: inicia a autorização para a empresa autenticada e devolve a URL oficial da Meta.
+- `GET|POST /api/whatsapp?action=onboarding-callback`: consome uma única vez o retorno OAuth/Embedded Signup e associa WABA e número confirmados.
 - `GET /api/whatsapp?action=messages`: mensagens da empresa autenticada.
 - `POST /api/whatsapp?action=connect`: salva a configuração cifrada.
 - `POST /api/whatsapp?action=validate`: verifica a configuração no provedor.

@@ -191,6 +191,31 @@ class SecurityTests(unittest.TestCase):
         emitted.assert_called_once()
         self.assertEqual(db.message_inserts,2)
         self.assertEqual(db.commits,2)
+    def test_shared_webhook_routes_by_waba_and_phone_not_waba_alone(self):
+        class Cursor:
+            def __init__(self,row=None):self.row=row
+            def fetchone(self):return self.row
+        class DB:
+            def __init__(self):self.calls=[]
+            def execute(self,query,params=None):
+                compact=' '.join(query.split());self.calls.append((compact,params))
+                if compact.startswith('SELECT w.* FROM whatsapp_connections'):
+                    return Cursor({'organization_id':self_org,'waba_id':'waba-1',
+                        'phone_number_id':'phone-2','app_secret_enc':'encrypted'})
+                return Cursor()
+            def commit(self):pass
+        self_org=self.org;db=DB();handler=wa.handler.__new__(wa.handler)
+        handler.raw_body=b'body';handler.headers={'X-Hub-Signature-256':'sha256='+'0'*64}
+        handler.reply=lambda status,payload,*_args:(status,payload)
+        payload={'object':'whatsapp_business_account','entry':[{'id':'waba-1','changes':[
+            {'field':'messages','value':{'messaging_product':'whatsapp',
+                'metadata':{'phone_number_id':'phone-2'},'messages':[],'statuses':[]}}]}]}
+        with patch.object(wa,'decrypt',return_value='secret'), \
+                patch.object(wa,'valid_signature',return_value=True):
+            self.assertEqual(handler.handle_webhook(db,'',payload)[0],200)
+        route=next(params for query,params in db.calls
+                   if query.startswith('SELECT w.* FROM whatsapp_connections'))
+        self.assertEqual(route,('waba-1','phone-2'))
     def test_whatsapp_schema_bootstraps_core_before_tenant_tables(self):
         timeline=[]
         class DB:

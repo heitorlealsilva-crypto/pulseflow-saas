@@ -21,7 +21,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from api import integration_events
+from api import integration_events, meta_onboarding
 from api.runtime import apply_inbound_response, ensure_schema as ensure_runtime_schema, persist_alert
 
 MAX_BODY = 2_000_000
@@ -114,6 +114,7 @@ def ensure_schema(db):
         db.execute(statement)
     ensure_runtime_schema(db, schema_key)
     integration_events.ensure_schema(db)
+    meta_onboarding.ensure_schema(db)
     db.commit()
     _SCHEMA_READY_FOR = schema_key
 
@@ -361,6 +362,14 @@ class handler(BaseHTTPRequestHandler):
     def failure(self, error):
         return self.reply(error.status, {"ok": False, "error": str(error), "code": error.code})
 
+    def redirect(self, location):
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def query(self):
         return {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
 
@@ -401,8 +410,22 @@ class handler(BaseHTTPRequestHandler):
                 ensure_schema(db)
                 if "hub.challenge" in query:
                     organization_id = normalized_uuid(query.get("organization_id"))
-                    if not organization_id or query.get("action") != "webhook":
+                    if query.get("action") != "webhook":
                         return self.reply(403, "verificação recusada", "text/plain; charset=utf-8")
+                    if not organization_id:
+                        configured = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "")
+                        candidate = query.get("hub.verify_token", "")
+                        if (len(configured) < 32 or query.get("hub.mode") != "subscribe"
+                                or not hmac.compare_digest(configured, candidate)):
+                            return self.reply(403, "verificação recusada", "text/plain; charset=utf-8")
+                        db.execute("""INSERT INTO meta_app_configuration(singleton,webhook_verified_at,updated_at)
+                            VALUES(TRUE,NOW(),NOW()) ON CONFLICT(singleton) DO UPDATE SET
+                            webhook_verified_at=NOW(),updated_at=NOW()""")
+                        db.execute("""UPDATE whatsapp_connections SET webhook_verified_at=NOW(),
+                            status=CASE WHEN meta_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,
+                            updated_at=NOW() WHERE phone_number_id<>''""")
+                        db.commit()
+                        return self.reply(200, query["hub.challenge"], "text/plain; charset=utf-8")
                     row = db.execute("""SELECT w.verify_token_hash FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
                         WHERE w.organization_id=%s AND o.status='active'""", (organization_id,)).fetchone()
                     candidate = hashlib.sha256(query.get("hub.verify_token", "").encode()).hexdigest()
@@ -413,10 +436,19 @@ class handler(BaseHTTPRequestHandler):
                         WHERE organization_id=%s""", (organization_id,))
                     db.commit()
                     return self.reply(200, query["hub.challenge"], "text/plain; charset=utf-8")
+                if query.get("action") == "onboarding-callback":
+                    return self.onboarding_redirect_callback(db, query)
                 _, organization_id = self.authenticated_org(db, query.get("organization_id", ""), "whatsapp_read")
                 if query.get("action") == "connection":
                     row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
                     return self.reply(200, connection_payload(row, organization_id))
+                if query.get("action") == "onboarding-status":
+                    value = meta_onboarding.status_payload(
+                        db, organization_id,
+                        meta_onboarding.session_hash_from_cookie(self.headers.get("Cookie", "")))
+                    row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
+                    value.update({"ok": True, "connection": connection_payload(row, organization_id)})
+                    return self.reply(200, value)
                 if query.get("action") == "messages":
                     try:
                         cursor, limit = max(0, int(query.get("cursor", "0"))), min(200, max(1, int(query.get("limit", "100"))))
@@ -430,7 +462,7 @@ class handler(BaseHTTPRequestHandler):
                     page = rows[:limit]
                     return self.reply(200, {"ok": True, "messages": page, "next_cursor": str(page[-1]["revision"] if page else cursor), "has_more": len(rows) > limit})
                 return self.reply(404, {"ok": False, "error": "Ação não encontrada."})
-        except IntegrationError as error:
+        except (IntegrationError, meta_onboarding.OnboardingError) as error:
             return self.failure(error)
         except Exception:
             return self.reply(503, {"ok": False, "error": "Integração indisponível. Tente novamente mais tarde.", "code": "integration_unavailable"})
@@ -446,6 +478,14 @@ class handler(BaseHTTPRequestHandler):
                     return self.handle_webhook(db, query.get("organization_id", ""), payload)
                 permission = "whatsapp_send" if query.get("action") == "send" else "whatsapp_manage"
                 user, organization_id = self.authenticated_org(db, str(payload.get("organization_id", "")), permission)
+                if query.get("action") == "onboarding-start":
+                    result = meta_onboarding.start_flow(
+                        db, organization_id, user["id"],
+                        meta_onboarding.session_hash_from_cookie(self.headers.get("Cookie", "")),
+                        payload.get("return_url", "/"))
+                    return self.reply(201, {"ok": True, **result})
+                if query.get("action") == "onboarding-callback":
+                    return self.onboarding_post_callback(db, user, organization_id, payload)
                 if query.get("action") == "prepare-webhook":
                     return self.prepare_webhook(db, organization_id, payload)
                 if query.get("action") == "connect":
@@ -463,10 +503,148 @@ class handler(BaseHTTPRequestHandler):
                 if query.get("action") == "send":
                     return self.send_message(db, organization_id, payload, user)
                 return self.reply(404, {"ok": False, "error": "Ação não encontrada."})
-        except IntegrationError as error:
+        except (IntegrationError, meta_onboarding.OnboardingError) as error:
             return self.failure(error)
         except Exception:
             return self.reply(503, {"ok": False, "error": "Integração indisponível. Nenhum envio será repetido automaticamente.", "code": "integration_unavailable"})
+
+    def onboarding_redirect_callback(self, db, query):
+        session_hash = meta_onboarding.session_hash_from_cookie(self.headers.get("Cookie", ""))
+        user = session_user(db, self.headers.get("Cookie", ""))
+        if not user or not session_hash:
+            raise meta_onboarding.OnboardingError(
+                "Entre novamente e reinicie a conexão com a Meta.", "unauthenticated", 401)
+        flow = meta_onboarding.consume_state(db, query.get("state", ""), session_hash)
+        return_path = meta_onboarding.safe_return_path(flow.get("return_path"))
+        if str(flow.get("user_id")) != str(user.get("id")):
+            meta_onboarding.mark_failed(db, flow["id"], "oauth_session_mismatch")
+            raise meta_onboarding.OnboardingError(
+                "A sessão da conexão não corresponde ao usuário atual.", "oauth_session_mismatch", 403)
+        if query.get("error"):
+            meta_onboarding.mark_failed(db, flow["id"], "meta_authorization_cancelled")
+            return self.redirect(self._onboarding_return(return_path, flow["id"], "failed",
+                                                        "meta_authorization_cancelled"))
+        try:
+            access_token = meta_onboarding.exchange_code(query.get("code", ""), flow)
+            meta_onboarding.remember_authorization(db, flow["id"], access_token,
+                                                   "asset_selection_required")
+            assets = meta_onboarding.discover_assets(access_token)
+        except meta_onboarding.OnboardingError as error:
+            # Preserve a successfully exchanged token when only asset discovery
+            # failed; the authenticated owner can retry/finalize that flow.
+            if "access_token" in locals():
+                meta_onboarding.remember_authorization(
+                    db, flow["id"], access_token, "asset_selection_required", error.code)
+            else:
+                meta_onboarding.mark_failed(db, flow["id"], error.code)
+            return self.redirect(self._onboarding_return(return_path, flow["id"], "failed", error.code))
+        if len(assets) == 1:
+            asset = assets[0]
+            try:
+                authorized, token, business_number = meta_onboarding.complete_flow(
+                    db, flow["id"], str(flow["organization_id"]), user["id"], session_hash,
+                    asset["waba_id"], asset["phone_number_id"])
+                meta_onboarding.subscribe_app(token, asset["waba_id"])
+                self.persist_oauth_connection(
+                    db, str(flow["organization_id"]), user, authorized, token,
+                    asset["waba_id"], asset["phone_number_id"], business_number)
+                return self.redirect(self._onboarding_return(return_path, flow["id"], "connected"))
+            except (IntegrationError, meta_onboarding.OnboardingError) as error:
+                meta_onboarding.remember_authorization(
+                    db, flow["id"], access_token, "asset_selection_required", error.code)
+                return self.redirect(self._onboarding_return(return_path, flow["id"], "failed", error.code))
+        # Redirect OAuth does not reliably return the selected WABA and phone.
+        # The same flow is completed by the first-party UI with the IDs emitted
+        # by Meta's Embedded Signup completion event.
+        return self.redirect(self._onboarding_return(return_path, flow["id"],
+                                                    "asset_selection_required"))
+
+    def _onboarding_return(self, return_path, flow_id, status, error_code=None):
+        separator = "&" if "?" in return_path else "?"
+        values = {"meta_flow": str(flow_id), "meta_status": str(status)}
+        if error_code:
+            values["meta_error"] = str(error_code)[:100]
+        return return_path + separator + urlencode(values)
+
+    def onboarding_post_callback(self, db, user, organization_id, payload):
+        session_hash = meta_onboarding.session_hash_from_cookie(self.headers.get("Cookie", ""))
+        flow_id = payload.get("flow_id")
+        if payload.get("code"):
+            flow = meta_onboarding.consume_state(db, payload.get("state", ""), session_hash)
+            flow_id = str(flow["id"])
+            if (str(flow.get("organization_id")) != str(organization_id)
+                    or str(flow.get("user_id")) != str(user.get("id"))):
+                meta_onboarding.mark_failed(db, flow_id, "oauth_session_mismatch")
+                raise meta_onboarding.OnboardingError(
+                    "Esta autorização pertence a outra conta.", "oauth_session_mismatch", 403)
+            try:
+                access_token = meta_onboarding.exchange_code(payload["code"], flow)
+                meta_onboarding.remember_authorization(db, flow_id, access_token,
+                                                       "asset_selection_required")
+            except meta_onboarding.OnboardingError as error:
+                meta_onboarding.mark_failed(db, flow_id, error.code)
+                raise
+        if not flow_id:
+            raise meta_onboarding.OnboardingError(
+                "A tentativa de conexão não foi informada.", "invalid_onboarding_flow", 400)
+        flow, access_token, business_number = meta_onboarding.complete_flow(
+            db, flow_id, organization_id, user["id"], session_hash,
+            payload.get("waba_id"), payload.get("phone_number_id"))
+        meta_onboarding.subscribe_app(access_token, str(payload.get("waba_id")))
+        self.persist_oauth_connection(db, organization_id, user, flow, access_token,
+                                      str(payload.get("waba_id")),
+                                      str(payload.get("phone_number_id")), business_number)
+        row = db.execute("SELECT * FROM whatsapp_connections WHERE organization_id=%s", (organization_id,)).fetchone()
+        return self.reply(200, {"ok": True, "flow_id": flow_id,
+                               "connection": connection_payload(row, organization_id)})
+
+    def persist_oauth_connection(self, db, organization_id, user, flow, access_token,
+                                 waba_id, phone_number_id, business_number):
+        app_secret = os.getenv("META_APP_SECRET", "").strip()
+        verify_token = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "").strip()
+        if len(app_secret) < 16 or len(verify_token) < 32:
+            raise meta_onboarding.OnboardingError(
+                "A configuração segura da Meta está incompleta no servidor.",
+                "meta_configuration_incomplete")
+        encryption = cipher()
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                   ("wa-phone:" + phone_number_id,))
+        other = db.execute("""SELECT organization_id FROM whatsapp_connections
+            WHERE phone_number_id=%s AND organization_id<>%s""",
+            (phone_number_id, organization_id)).fetchone()
+        if other:
+            raise meta_onboarding.OnboardingError(
+                "Este número já está vinculado a outra conta do PulseFlow.",
+                "phone_already_connected", 409)
+        app_ready = db.execute("""SELECT webhook_verified_at FROM meta_app_configuration
+            WHERE singleton=TRUE""").fetchone()
+        webhook_verified_at = (app_ready or {}).get("webhook_verified_at")
+        version = meta_onboarding.oauth_config()["graph_version"]
+        db.execute("""INSERT INTO whatsapp_connections(
+                organization_id,phone_number_id,waba_id,business_number,access_token_enc,
+                app_secret_enc,verify_token_hash,graph_version,status,meta_verified_at,webhook_verified_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+            ON CONFLICT(organization_id) DO UPDATE SET
+                phone_number_id=EXCLUDED.phone_number_id,waba_id=EXCLUDED.waba_id,
+                business_number=EXCLUDED.business_number,access_token_enc=EXCLUDED.access_token_enc,
+                app_secret_enc=EXCLUDED.app_secret_enc,verify_token_hash=EXCLUDED.verify_token_hash,
+                graph_version=EXCLUDED.graph_version,status=EXCLUDED.status,meta_verified_at=NOW(),
+                webhook_verified_at=EXCLUDED.webhook_verified_at,last_event_at=NULL,updated_at=NOW()""",
+            (organization_id, phone_number_id, waba_id, business_number,
+             encryption.encrypt(access_token.encode()).decode(),
+             encryption.encrypt(app_secret.encode()).decode(),
+             hashlib.sha256(verify_token.encode()).hexdigest(), version,
+             "ready" if webhook_verified_at else "configured", webhook_verified_at))
+        db.execute("""UPDATE meta_onboarding_flows SET status='completed',waba_id=%s,
+            phone_number_id=%s,access_token_enc=NULL,code_verifier_enc=NULL,
+            completed_at=NOW(),updated_at=NOW() WHERE id=%s""",
+            (waba_id, phone_number_id, flow["id"]))
+        db.execute("""INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata)
+            VALUES(%s,%s,'whatsapp.meta_connected',%s::jsonb)""",
+            (user["id"], organization_id,
+             json.dumps({"flow_id": str(flow["id"]), "waba_id": waba_id,
+                         "phone_number_id": phone_number_id})))
+        db.commit()
 
     def save_connection(self, db, organization_id, payload):
         encryption = cipher()
@@ -535,10 +713,23 @@ class handler(BaseHTTPRequestHandler):
 
     def handle_webhook(self, db, organization_id, payload):
         organization_id = normalized_uuid(organization_id)
-        if not organization_id:
-            return self.reply(403, {"ok": False})
-        row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
-            WHERE w.organization_id=%s AND o.status='active' FOR UPDATE OF w""", (organization_id,)).fetchone()
+        if organization_id:
+            row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
+                WHERE w.organization_id=%s AND o.status='active' FOR UPDATE OF w""", (organization_id,)).fetchone()
+        else:
+            entry_ids = {str(entry.get("id")) for entry in payload.get("entry", [])
+                         if isinstance(entry, dict) and entry.get("id")}
+            phone_ids = {str(change.get("value", {}).get("metadata", {}).get("phone_number_id"))
+                         for entry in payload.get("entry", []) if isinstance(entry, dict)
+                         for change in entry.get("changes", []) if isinstance(change, dict)
+                         and change.get("field") == "messages"
+                         and change.get("value", {}).get("metadata", {}).get("phone_number_id")}
+            if len(entry_ids) != 1 or len(phone_ids) != 1:
+                return self.reply(403, {"ok": False})
+            row = db.execute("""SELECT w.* FROM whatsapp_connections w JOIN organizations o ON o.id=w.organization_id
+                WHERE w.waba_id=%s AND w.phone_number_id=%s AND o.status='active' FOR UPDATE OF w""",
+                (entry_ids.pop(), phone_ids.pop())).fetchone()
+            organization_id = normalized_uuid((row or {}).get("organization_id"))
         if not row or not valid_signature(decrypt(row["app_secret_enc"]), getattr(self, "raw_body", b""), self.headers.get("X-Hub-Signature-256", "")):
             return self.reply(401, {"ok": False})
         if payload.get("object") != "whatsapp_business_account" or not isinstance(payload.get("entry"), list):
