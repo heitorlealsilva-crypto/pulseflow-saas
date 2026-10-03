@@ -87,6 +87,7 @@ def ensure_schema(db):
         )""",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS meta_verified_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS webhook_verified_at TIMESTAMPTZ",
+        "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS messages_subscribed_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS last_event_at TIMESTAMPTZ",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS platform_managed BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE whatsapp_connections ADD COLUMN IF NOT EXISTS platform_app_id TEXT",
@@ -122,6 +123,15 @@ def ensure_schema(db):
     ensure_runtime_schema(db, schema_key)
     integration_events.ensure_schema(db)
     meta_onboarding.ensure_schema(db)
+    # Earlier OAuth completions only reached "completed" after Meta accepted
+    # subscribed_apps and registration. Preserve that evidence on migration;
+    # manual connections have no equivalent proof and are not backfilled.
+    db.execute("""UPDATE whatsapp_connections w SET messages_subscribed_at=f.completed_at
+        FROM meta_onboarding_flows f
+        WHERE w.messages_subscribed_at IS NULL AND w.platform_managed=TRUE
+        AND f.organization_id=w.organization_id AND f.waba_id=w.waba_id
+        AND f.phone_number_id=w.phone_number_id AND f.status='completed'
+        AND f.completed_at IS NOT NULL""")
     db.commit()
     _SCHEMA_READY_FOR = schema_key
 
@@ -289,8 +299,9 @@ def connection_payload(row, organization_id):
     public = {key: row.get(key) for key in PUBLIC_CONNECTION_FIELDS} if credentials_saved else None
     token_expiry = timestamp((row or {}).get("token_expires_at"))
     token_current = not token_expiry or token_expiry > datetime.now(timezone.utc)
-    registered = bool(row and (not platform_managed or row.get("registered_at")))
-    ready = bool(credentials_saved and token_current and registered
+    registered = bool(row and row.get("registered_at"))
+    messages_subscribed = bool(row and row.get("messages_subscribed_at"))
+    ready = bool(credentials_saved and token_current and registered and messages_subscribed
                  and row.get("meta_verified_at") and row.get("webhook_verified_at"))
     encryption_ready = len(os.getenv("PULSEFLOW_ENCRYPTION_KEY", "")) >= 32
     meta_verified = bool(row and row.get("meta_verified_at"))
@@ -307,7 +318,7 @@ def connection_payload(row, organization_id):
                 "credentials_saved": bool(row),
                 "meta_verified": meta_verified,
                 "webhook_verified": webhook_verified,
-                "messages_subscribed": webhook_verified,
+                "messages_subscribed": messages_subscribed,
                 "phone_registered": registered,
                 "token_current": token_current,
             },
@@ -326,13 +337,20 @@ def graph_call(row, path, method="GET", payload=None):
 
 
 def validate_meta(db, organization_id, row):
-    phone = graph_call(row, quote(row["phone_number_id"], safe="") + "?fields=id,display_phone_number")
+    phone = graph_call(row, quote(row["phone_number_id"], safe="") + "?fields=id,display_phone_number,status,platform_type")
     phones = graph_call(row, quote(row["waba_id"], safe="") + "/phone_numbers?fields=id&limit=100")
     if str(phone.get("id")) != row["phone_number_id"] or not any(str(item.get("id")) == row["phone_number_id"] for item in phones.get("data", [])):
         raise IntegrationError("O número não pertence à conta comercial informada.", "meta_account_mismatch", 409)
-    db.execute("""UPDATE whatsapp_connections SET meta_verified_at=NOW(),
-        status=CASE WHEN webhook_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,updated_at=NOW()
-        WHERE organization_id=%s""", (organization_id,))
+    if phone.get("status") != "CONNECTED" or phone.get("platform_type") != "CLOUD_API":
+        raise IntegrationError("O número ainda não aparece como conectado à Cloud API da Meta. Conclua o registro do número e valide novamente.",
+                               "phone_not_registered", 409)
+    subscription = graph_call(row, quote(row["waba_id"], safe="") + "/subscribed_apps", "POST")
+    if subscription.get("success") is not True:
+        raise IntegrationError("A Meta não confirmou a assinatura do webhook de mensagens.", "meta_subscription_failed", 502)
+    db.execute("""UPDATE whatsapp_connections SET meta_verified_at=NOW(),messages_subscribed_at=NOW(),
+        registered_at=NOW(),
+        status=CASE WHEN webhook_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,
+        updated_at=NOW() WHERE organization_id=%s""", (organization_id,))
     db.commit()
 
 
@@ -438,7 +456,9 @@ class handler(BaseHTTPRequestHandler):
                             VALUES(TRUE,NOW(),NOW()) ON CONFLICT(singleton) DO UPDATE SET
                             webhook_verified_at=NOW(),updated_at=NOW()""")
                         db.execute("""UPDATE whatsapp_connections SET webhook_verified_at=NOW(),
-                            status=CASE WHEN meta_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,
+                            status=CASE WHEN meta_verified_at IS NOT NULL AND messages_subscribed_at IS NOT NULL
+                                AND registered_at IS NOT NULL
+                                THEN 'ready' ELSE 'configured' END,
                             updated_at=NOW() WHERE platform_managed=TRUE
                             AND meta_verified_at IS NOT NULL AND registered_at IS NOT NULL""")
                         db.commit()
@@ -449,7 +469,9 @@ class handler(BaseHTTPRequestHandler):
                     if query.get("hub.mode") != "subscribe" or not row or not hmac.compare_digest(row["verify_token_hash"], candidate):
                         return self.reply(403, "verificação recusada", "text/plain; charset=utf-8")
                     db.execute("""UPDATE whatsapp_connections SET webhook_verified_at=NOW(),
-                        status=CASE WHEN meta_verified_at IS NOT NULL THEN 'ready' ELSE 'configured' END,updated_at=NOW()
+                        status=CASE WHEN meta_verified_at IS NOT NULL AND messages_subscribed_at IS NOT NULL
+                            AND registered_at IS NOT NULL
+                            THEN 'ready' ELSE 'configured' END,updated_at=NOW()
                         WHERE organization_id=%s""", (organization_id,))
                     db.commit()
                     return self.reply(200, query["hub.challenge"], "text/plain; charset=utf-8")
@@ -634,8 +656,9 @@ class handler(BaseHTTPRequestHandler):
         db.execute("""INSERT INTO whatsapp_connections(
                 organization_id,phone_number_id,waba_id,business_number,access_token_enc,
                 app_secret_enc,verify_token_hash,graph_version,status,platform_managed,platform_app_id,
-                registration_pin_enc,token_expires_at,registered_at,meta_verified_at,webhook_verified_at)
-            VALUES(%s,%s,%s,%s,%s,'',%s,%s,%s,TRUE,%s,%s,%s,NOW(),NOW(),%s)
+                registration_pin_enc,token_expires_at,registered_at,meta_verified_at,webhook_verified_at,
+                messages_subscribed_at)
+            VALUES(%s,%s,%s,%s,%s,'',%s,%s,%s,TRUE,%s,%s,%s,NOW(),NOW(),%s,NOW())
             ON CONFLICT(organization_id) DO UPDATE SET
                 phone_number_id=EXCLUDED.phone_number_id,waba_id=EXCLUDED.waba_id,
                 business_number=EXCLUDED.business_number,access_token_enc=EXCLUDED.access_token_enc,
@@ -644,6 +667,7 @@ class handler(BaseHTTPRequestHandler):
                 platform_app_id=EXCLUDED.platform_app_id,registration_pin_enc=EXCLUDED.registration_pin_enc,
                 token_expires_at=EXCLUDED.token_expires_at,registered_at=EXCLUDED.registered_at,
                 meta_verified_at=NOW(),webhook_verified_at=EXCLUDED.webhook_verified_at,
+                messages_subscribed_at=NOW(),
                 last_event_at=NULL,updated_at=NOW()""",
             (organization_id, phone_number_id, waba_id, business_number,
              encryption.encrypt(access_token.encode()).decode(),
@@ -684,7 +708,7 @@ class handler(BaseHTTPRequestHandler):
             verify_token_hash=EXCLUDED.verify_token_hash,graph_version=EXCLUDED.graph_version,status='configured',
             platform_managed=FALSE,platform_app_id=NULL,registration_pin_enc=NULL,
             token_expires_at=NULL,registered_at=NULL,
-            meta_verified_at=NULL,
+            meta_verified_at=NULL,messages_subscribed_at=NULL,
             webhook_verified_at=CASE WHEN whatsapp_connections.verify_token_hash=EXCLUDED.verify_token_hash
                 THEN whatsapp_connections.webhook_verified_at ELSE NULL END,
             last_event_at=NULL,updated_at=NOW()""",

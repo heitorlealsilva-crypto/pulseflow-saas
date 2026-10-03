@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -81,6 +82,27 @@ def _audience_matches(value: object) -> bool:
     return value == AUDIENCE or isinstance(value, list) and AUDIENCE in value
 
 
+def _subject_matches(claims: dict, repository: str) -> bool:
+    """Accept GitHub's legacy and July 2026 immutable default subjects.
+
+    IDs in the immutable subject must agree with the separately signed claims;
+    the workflow has no environment, so only the main-branch subject is valid.
+    """
+    subject = claims.get("sub")
+    if subject == f"repo:{repository}:ref:refs/heads/main":
+        return True
+    owner, separator, name = repository.partition("/")
+    if not separator or not owner or not name:
+        return False
+    owner_id = claims.get("repository_owner_id")
+    repository_id = claims.get("repository_id")
+    if not (isinstance(owner_id, str) and re.fullmatch(r"[1-9][0-9]*", owner_id)
+            and isinstance(repository_id, str) and re.fullmatch(r"[1-9][0-9]*", repository_id)):
+        return False
+    return subject == (f"repo:{owner}@{owner_id}/{name}@{repository_id}"
+                       ":ref:refs/heads/main")
+
+
 def verify_token(token: str, now: float | None = None, keys: list[dict] | None = None) -> bool:
     """Return True only for the dedicated workflow on the main branch."""
     try:
@@ -105,8 +127,7 @@ def verify_token(token: str, now: float | None = None, keys: list[dict] | None =
             and claims.get("ref") == "refs/heads/main"
             and claims.get("ref_type") == "branch"
             and claims.get("event_name") in {"schedule", "workflow_dispatch"}
-            and isinstance(claims.get("sub"), str)
-            and claims["sub"].startswith(f"repo:{repository}:")
+            and _subject_matches(claims, repository)
             and exp >= now - 30
             and nbf <= now + 30
             and now - 900 <= issued <= now + 30

@@ -55,10 +55,38 @@ class GitHubOIDCTests(unittest.TestCase):
             {"workflow_ref": "heitorlealsilva-crypto/pulseflow-saas/.github/workflows/other.yml@refs/heads/main"},
             {"ref": "refs/heads/feature"},
             {"event_name": "pull_request"},
+            {"sub": self.claims["sub"] + ":environment:production"},
             {"exp": self.now - 60},
             {"iat": self.now - 901},
         ):
             self.assertFalse(github_oidc.verify_token(self.token(changes), self.now, self.keys), changes)
+
+    def test_immutable_subject_must_match_signed_repository_ids(self):
+        repository = github_oidc.DEFAULT_REPOSITORY
+        owner, name = repository.split("/")
+        subject = f"repo:{owner}@12345/{name}@67890:ref:refs/heads/main"
+        immutable = {
+            "sub": subject,
+            "repository_owner_id": "12345",
+            "repository_id": "67890",
+        }
+        self.assertTrue(github_oidc.verify_token(self.token(immutable), self.now, self.keys))
+        for changes in (
+            {"repository_owner_id": "99999"},
+            {"repository_id": "99999"},
+            {"repository_owner_id": "0"},
+            {"repository_id": "not-a-number"},
+            {"sub": subject.replace(f"{name}@", "other-repo@")},
+            {"sub": subject.replace("refs/heads/main", "refs/heads/other")},
+            {"sub": subject + ":environment:production"},
+        ):
+            self.assertFalse(github_oidc.verify_token(
+                self.token({**immutable, **changes}), self.now, self.keys), changes)
+        for missing in ("repository_owner_id", "repository_id"):
+            incomplete = dict(immutable)
+            incomplete.pop(missing)
+            self.assertFalse(github_oidc.verify_token(
+                self.token(incomplete), self.now, self.keys), missing)
 
     def test_rejects_invalid_signature_or_algorithm(self):
         other = rsa.generate_private_key(public_exponent=65537, key_size=2048)

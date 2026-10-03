@@ -218,9 +218,9 @@ class SecurityTests(unittest.TestCase):
                    if query.startswith('SELECT w.* FROM whatsapp_connections'))
         self.assertEqual(route,('123456789012345','234567890123456'))
     def test_whatsapp_schema_bootstraps_core_before_tenant_tables(self):
-        timeline=[]
+        timeline=[];queries=[]
         class DB:
-            def execute(self,query,params=None):timeline.append('sql');return self
+            def execute(self,query,params=None):timeline.append('sql');queries.append(query);return self
             def commit(self):timeline.append('commit')
         previous=wa._SCHEMA_READY_FOR
         wa._SCHEMA_READY_FOR=None
@@ -236,17 +236,64 @@ class SecurityTests(unittest.TestCase):
         self.assertLess(timeline.index('core'),timeline.index('runtime'))
         self.assertLess(timeline.index('runtime'),timeline.index('events'))
         self.assertEqual(timeline[-1],'commit')
+        backfill=next(query for query in queries if 'SET messages_subscribed_at=f.completed_at' in query)
+        self.assertIn("f.status='completed'",backfill)
+        self.assertIn('w.platform_managed=TRUE',backfill)
     def test_configured_does_not_mean_connected(self):
         self.assertFalse(wa.connection_payload({'status':'active'},self.org)['ready'])
         self.assertFalse(wa.connection_payload({'meta_verified_at':self.now},self.org)['ready'])
         configured={'phone_number_id':'12345','waba_id':'67890','access_token_enc':'x','app_secret_enc':'y'}
-        self.assertTrue(wa.connection_payload({**configured,'meta_verified_at':self.now,'webhook_verified_at':self.now},self.org)['ready'])
+        verified={**configured,'meta_verified_at':self.now,'webhook_verified_at':self.now}
+        self.assertFalse(wa.connection_payload(verified,self.org)['ready'])
+        self.assertFalse(wa.connection_payload(verified,self.org)['setup']['messages_subscribed'])
+        subscribed={**verified,'messages_subscribed_at':self.now}
+        self.assertFalse(wa.connection_payload(subscribed,self.org)['ready'])
+        self.assertFalse(wa.connection_payload(subscribed,self.org)['setup']['phone_registered'])
+        subscribed['registered_at']=self.now
+        self.assertTrue(wa.connection_payload(subscribed,self.org)['ready'])
+        self.assertTrue(wa.connection_payload(subscribed,self.org)['setup']['messages_subscribed'])
+    def test_manual_validation_requires_meta_subscription_confirmation(self):
+        db=MagicMock()
+        row={'phone_number_id':'12345','waba_id':'67890','graph_version':'v23.0'}
+        responses=[{'id':'12345','status':'CONNECTED','platform_type':'CLOUD_API'},
+                   {'data':[{'id':'12345'}]},{'success':False}]
+        with patch.object(wa,'graph_call',side_effect=responses) as graph:
+            with self.assertRaises(wa.IntegrationError) as caught:
+                wa.validate_meta(db,self.org,row)
+        self.assertEqual(caught.exception.code,'meta_subscription_failed')
+        graph.assert_any_call(row,'67890/subscribed_apps','POST')
+        db.execute.assert_not_called()
+        db.commit.assert_not_called()
+    def test_manual_validation_persists_confirmed_subscription(self):
+        db=MagicMock()
+        row={'phone_number_id':'12345','waba_id':'67890','graph_version':'v23.0'}
+        responses=[{'id':'12345','status':'CONNECTED','platform_type':'CLOUD_API'},
+                   {'data':[{'id':'12345'}]},{'success':True}]
+        with patch.object(wa,'graph_call',side_effect=responses):
+            wa.validate_meta(db,self.org,row)
+        query,params=db.execute.call_args.args
+        self.assertIn('messages_subscribed_at=NOW()',query)
+        self.assertIn('registered_at=NOW()',query)
+        self.assertEqual(params,(self.org,))
+        db.commit.assert_called_once()
+    def test_manual_validation_does_not_assume_registration_from_phone_ownership(self):
+        db=MagicMock()
+        row={'phone_number_id':'12345','waba_id':'67890','graph_version':'v23.0'}
+        responses=[{'id':'12345','status':'PENDING','platform_type':'CLOUD_API'},
+                   {'data':[{'id':'12345'}]},{'success':True}]
+        with patch.object(wa,'graph_call',side_effect=responses) as graph:
+            with self.assertRaises(wa.IntegrationError) as caught:
+                wa.validate_meta(db,self.org,row)
+        self.assertEqual(caught.exception.code,'phone_not_registered')
+        self.assertEqual(graph.call_count,2)
+        db.execute.assert_not_called()
+        db.commit.assert_not_called()
     def test_connection_setup_checklist_is_explicit(self):
         with patch.dict('os.environ',{'PULSEFLOW_ENCRYPTION_KEY':'test-only-key-not-for-production-12345'}):
             value=wa.connection_payload({'phone_number_id':'12345','waba_id':'67890','access_token_enc':'x','app_secret_enc':'y','meta_verified_at':self.now},self.org)
         self.assertEqual(value['setup'],{'server_ready':True,'credentials_saved':True,
             'meta_verified':True,'webhook_verified':False,'messages_subscribed':False,
-            'phone_registered':True,'token_current':True})
+            'phone_registered':False,'token_current':True})
     def test_prepared_webhook_is_not_reported_as_credentials(self):
         value=wa.connection_payload({'verify_token_hash':'secret','webhook_verified_at':self.now},self.org)
         self.assertFalse(value['configured']);self.assertTrue(value['webhook_prepared']);self.assertFalse(value['ready'])
