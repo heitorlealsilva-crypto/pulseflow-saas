@@ -27,7 +27,7 @@ from server import Handler as StaticHandler  # noqa: E402
 PERMISSIONS = {name: True for name in (
     "workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage"
 )}
-LEGAL_VERSION = "2026-09-20"
+LEGAL_VERSION = "2026-10-03"
 LOCK = threading.RLock()
 STORE = {
     "accounts": {}, "users": {}, "sessions": {}, "workspaces": {}, "audits": [],

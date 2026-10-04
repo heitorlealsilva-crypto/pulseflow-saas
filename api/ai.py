@@ -13,7 +13,7 @@ import re
 import urllib.error
 import urllib.request
 import uuid
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
@@ -117,6 +117,33 @@ def continuous_limit(plan):
     return CONTINUOUS_DAILY_LIMITS.get(str(plan), CONTINUOUS_DAILY_LIMITS["Base"])
 
 
+def response_usage_tokens(response):
+    usage = response.get("usage") if isinstance(response, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+
+    def token_count(value):
+        try:
+            return min(1_000_000_000, max(0, int(value or 0)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    return token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))
+
+
+def release_manual_usage(db, organization_id, usage_date, user_id, lead_id, error_code, response=None):
+    """Return a failed request's reserved slot without losing known token costs."""
+    db.rollback()
+    input_tokens, output_tokens = response_usage_tokens(response)
+    db.execute("""UPDATE ai_usage_daily SET requests=GREATEST(requests-1,0),
+        input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,updated_at=NOW()
+        WHERE organization_id=%s AND usage_date=%s""",
+        (input_tokens, output_tokens, organization_id, usage_date))
+    db.execute("""INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata)
+        VALUES(%s,%s,'ai.analysis.failed',%s::jsonb)""",
+        (user_id, organization_id, json.dumps({"lead_id": lead_id, "code": error_code})))
+    db.commit()
+
+
 def redact(value, limit):
     text = str(value or "").replace("\x00", " ")[:limit]
     text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[email]", text)
@@ -184,11 +211,18 @@ def build_context(db, organization_id, workspace, lead, trigger="manual", column
         retention_days = min(730, max(7, int(ai.get("memoryRetentionDays") or 180)))
     except (TypeError, ValueError):
         retention_days = 180
-    previous = db.execute("""SELECT result FROM ai_analyses WHERE organization_id=%s
-        AND created_at >= NOW() - (%s * INTERVAL '1 day')
-        ORDER BY created_at DESC LIMIT 12""", (organization_id, retention_days)).fetchall()
+    eligible_lead_ids = {str(item.get("id")) for item in (workspace.get("leads") or [])
+                         if isinstance(item, dict) and item.get("id")
+                         and not item.get("optOut") and not item.get("doNotContact")}
+    previous = []
+    if ai.get("learningEnabled") and eligible_lead_ids:
+        previous = db.execute("""SELECT lead_id,result FROM ai_analyses WHERE organization_id=%s
+            AND created_at >= NOW() - (%s * INTERVAL '1 day')
+            ORDER BY created_at DESC LIMIT 50""", (organization_id, retention_days)).fetchall()
     memories = []
     for row in previous:
+        if str(row.get("lead_id")) not in eligible_lead_ids:
+            continue
         result = row.get("result") or {}
         for fact in result.get("memory_facts", []):
             cleaned = redact(fact, 240)
@@ -232,14 +266,14 @@ def build_context(db, organization_id, workspace, lead, trigger="manual", column
         },
         "recent_conversation": messages,
         "recent_calls": calls,
-        "approved_business_memories": memories[:20],
+        "prior_unverified_observations": memories[:20],
     }
 
 
 def context_hash(context):
     """Hash only this lead/config input, avoiding cross-lead reanalysis cascades."""
     stable = dict(context)
-    stable.pop("approved_business_memories", None)
+    stable.pop("prior_unverified_observations", None)
     return hashlib.sha256(json.dumps(stable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -468,7 +502,7 @@ class handler(BaseHTTPRequestHandler):
                 _, organization_id = self.authenticated_org(db, query.get("organization_id", ""), "workspace_read")
                 account = db.execute("SELECT plan FROM organizations WHERE id=%s", (organization_id,)).fetchone()
                 usage = db.execute("SELECT requests,input_tokens,output_tokens FROM ai_usage_daily WHERE organization_id=%s AND usage_date=%s",
-                                   (organization_id, date.today())).fetchone() or {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+                                   (organization_id, datetime.now(timezone.utc).date())).fetchone() or {"requests": 0, "input_tokens": 0, "output_tokens": 0}
                 limit = plan_limit(account.get("plan") if account else "Base")
                 return self.reply(200, {"ok": True, "configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
                     "model": os.getenv("OPENAI_MODEL", DEFAULT_MODEL), "mode": "suggest_only",
@@ -498,33 +532,42 @@ class handler(BaseHTTPRequestHandler):
                 lead = next((item for item in workspace.get("leads", []) if str(item.get("id")) == lead_id), None)
                 if not lead:
                     raise AIError("Contato não encontrado nesta empresa.", "lead_not_found", 404)
+                if lead.get("optOut") or lead.get("doNotContact"):
+                    raise AIError("Este contato não permite análise de IA.", "contact_opted_out", 409)
                 if not (workspace.get("ai") or {}).get("enabled"):
                     raise AIError("Ative o agente desta empresa antes de analisar.", "agent_disabled", 409)
+                context = build_context(db, organization_id, workspace, lead)
+                request_payload = provider_request(context, organization_id, user["id"])
                 limit = plan_limit(account.get("plan") if account else "Base")
+                usage_date = datetime.now(timezone.utc).date()
                 reserved = db.execute("""INSERT INTO ai_usage_daily(organization_id,usage_date,requests)
                     VALUES(%s,%s,1) ON CONFLICT(organization_id,usage_date) DO UPDATE SET
                     requests=ai_usage_daily.requests+1,updated_at=NOW()
                     WHERE ai_usage_daily.requests < %s RETURNING requests""",
-                    (organization_id, date.today(), limit)).fetchone()
+                    (organization_id, usage_date, limit)).fetchone()
                 if not reserved:
                     raise AIError("O limite diário de análises deste plano foi atingido.", "daily_limit_reached", 429)
-                context = build_context(db, organization_id, workspace, lead)
-                request_payload = provider_request(context, organization_id, user["id"])
                 db.commit()
-                response = call_provider(request_payload)
-                result = enforce_safety(extract_analysis(response), lead)
-                usage = response.get("usage") or {}
-                db.execute("""UPDATE ai_usage_daily SET input_tokens=input_tokens+%s,
-                    output_tokens=output_tokens+%s,updated_at=NOW() WHERE organization_id=%s AND usage_date=%s""",
-                    (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), organization_id, date.today()))
-                analysis_id = str(uuid.uuid4())
-                input_hash = hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-                db.execute("""INSERT INTO ai_analyses(id,organization_id,lead_id,actor_user_id,model,result,input_hash)
-                    VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s)""",
-                    (analysis_id, organization_id, lead_id, user["id"], request_payload["model"], json.dumps(result, ensure_ascii=False), input_hash))
-                db.execute("INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata) VALUES(%s,%s,'ai.analysis.created',%s::jsonb)",
-                    (user["id"], organization_id, json.dumps({"analysis_id": analysis_id, "lead_id": lead_id, "model": request_payload["model"]})))
-                db.commit()
+                response = None
+                try:
+                    response = call_provider(request_payload)
+                    result = enforce_safety(extract_analysis(response), lead)
+                    input_tokens, output_tokens = response_usage_tokens(response)
+                    db.execute("""UPDATE ai_usage_daily SET input_tokens=input_tokens+%s,
+                        output_tokens=output_tokens+%s,updated_at=NOW() WHERE organization_id=%s AND usage_date=%s""",
+                        (input_tokens, output_tokens, organization_id, usage_date))
+                    analysis_id = str(uuid.uuid4())
+                    input_hash = hashlib.sha256(json.dumps(context, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                    db.execute("""INSERT INTO ai_analyses(id,organization_id,lead_id,actor_user_id,model,result,input_hash)
+                        VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+                        (analysis_id, organization_id, lead_id, user["id"], request_payload["model"], json.dumps(result, ensure_ascii=False), input_hash))
+                    db.execute("INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata) VALUES(%s,%s,'ai.analysis.created',%s::jsonb)",
+                        (user["id"], organization_id, json.dumps({"analysis_id": analysis_id, "lead_id": lead_id, "model": request_payload["model"]})))
+                    db.commit()
+                except Exception as error:
+                    release_manual_usage(db, organization_id, usage_date, user["id"], lead_id,
+                                         error.code if isinstance(error, AIError) else "ai_unavailable", response)
+                    raise
                 return self.reply(200, {"ok": True, "analysis_id": analysis_id, "analysis": result,
                     "model": request_payload["model"], "used_today": reserved["requests"], "daily_limit": limit})
         except AIError as error:

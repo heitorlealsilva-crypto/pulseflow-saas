@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import types
@@ -186,6 +187,104 @@ class WorkerTests(unittest.TestCase):
         workspace["ai"] = {"enabled": True, "learningEnabled": False}
         self.assertFalse(worker.ai_service.observation_policy(workspace, lead)["enabled"])
 
+    def test_ai_memories_expire_and_exclude_opted_out_or_removed_leads(self):
+        recent = (self.now - timedelta(days=10)).isoformat()
+        old = (self.now - timedelta(days=181)).isoformat()
+        workspace = self.workspace(self.lead())
+        workspace["leads"].extend([
+            self.lead(id="opted", optOut=True),
+            self.lead(id="no-contact", doNotContact=True),
+        ])
+        workspace["ai"] = {"memoryRetentionDays": 180, "memories": [
+            {"id": "keep", "leadId": "lead-1", "at": recent},
+            {"id": "expired", "leadId": "lead-1", "at": old},
+            {"id": "undated", "leadId": "lead-1"},
+            {"id": "invalid", "leadId": "lead-1", "at": "not-a-date"},
+            {"id": "future", "leadId": "lead-1", "at":
+             (self.now + timedelta(days=30)).isoformat()},
+            {"id": "opted", "leadId": "opted", "at": recent},
+            {"id": "no-contact", "leadId": "no-contact", "at": recent},
+            {"id": "removed", "leadId": "missing", "at": recent},
+        ]}
+        self.assertTrue(worker.prune_ai_memories(workspace, self.now))
+        self.assertEqual([m["id"] for m in workspace["ai"]["memories"]], ["keep"])
+        self.assertFalse(worker.prune_ai_memories(workspace, self.now))
+
+    def test_ai_memory_retention_is_bounded(self):
+        self.assertEqual(worker.memory_retention_days({"ai": {"memoryRetentionDays": 1}}), 7)
+        self.assertEqual(worker.memory_retention_days({"ai": {"memoryRetentionDays": 9999}}), 730)
+        self.assertEqual(worker.memory_retention_days({"ai": {"memoryRetentionDays": "bad"}}), 180)
+
+    def test_ai_memory_pruning_handles_legacy_malformed_leads(self):
+        for bad_leads in (None, {}, "invalid"):
+            workspace = {"leads": bad_leads, "ai": {"memories": [{
+                "leadId": "lead-1", "at": self.now.isoformat()}]}}
+            self.assertTrue(worker.prune_ai_memories(workspace, self.now))
+            self.assertEqual(workspace["ai"]["memories"], [])
+        self.assertEqual(worker.timestamp("2026-09-19T12:00:00"), self.now.timestamp())
+
+    def test_scheduler_persists_memory_pruning_without_due_actions(self):
+        workspace = self.workspace(self.lead())
+        workspace["ai"] = {"enabled": False, "memories": [{"id": "old",
+            "leadId": "lead-1", "at": (self.now - timedelta(days=200)).isoformat()}]}
+
+        class Result:
+            def __init__(self, row=None, rows=None):
+                self.row, self.rows = row, rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class DB:
+            def __init__(self):
+                self.saved = None
+                self.saved_org = None
+                self.analysis_cleanup_org = None
+
+            def execute(self, query, params=()):
+                if "pg_try_advisory_lock" in query:
+                    return Result({"acquired": True})
+                if "INSERT INTO worker_runs" in query:
+                    return Result({"id": 1})
+                if "SELECT w.organization_id FROM tenant_workspaces w" in query:
+                    return Result(rows=[{"organization_id": "org-1"}])
+                if "SELECT w.organization_id,w.state,w.revision" in query:
+                    return Result({"organization_id": "org-1", "state": workspace,
+                                   "revision": 1, "last_worker_at": None})
+                if "UPDATE tenant_workspaces SET state=%s::jsonb" in query:
+                    self.saved = json.loads(params[0])
+                    self.saved_org = params[1]
+                if "DELETE FROM ai_analyses WHERE organization_id=%s" in query:
+                    self.analysis_cleanup_org = params[0]
+                return Result()
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        db = DB()
+        with patch.object(worker, "ensure_schema"), \
+                patch.object(worker, "ensure_worker_schema"), \
+                patch.object(worker.ai_service, "ensure_schema"), \
+                patch.object(worker, "ensure_runtime_schema"), \
+                patch.object(worker, "collect_due_actions", return_value=[]), \
+                patch.object(worker, "queue_ai_observations", return_value=0), \
+                patch.object(worker, "process_ai_jobs", return_value={
+                    "completed": 0, "failed": 0, "deferred": 0, "skipped": 0}), \
+                patch.object(worker.integration_events, "process_deliveries", return_value={
+                    "claimed": 0, "delivered": 0, "retry": 0, "dead": 0, "paused": 0}), \
+                patch.object(worker.integration_events, "cleanup_history"):
+            result = worker.run_batch(db, self.now)
+        self.assertEqual(result["actionsCreated"], 0)
+        self.assertEqual(db.saved["ai"]["memories"], [])
+        self.assertEqual(db.saved_org, "org-1")
+        self.assertEqual(db.analysis_cleanup_org, "org-1")
+
     def test_observation_queue_reaches_unseen_leads_beyond_first_200(self):
         leads = [self.lead(
             id=f"lead-{index}",
@@ -226,7 +325,7 @@ class WorkerTests(unittest.TestCase):
                     return Result(all_rows=previous)
                 if "to_regclass('public.whatsapp_messages')" in query:
                     return Result({"table_name": None})
-                if "SELECT result FROM ai_analyses" in query:
+                if "FROM ai_analyses" in query:
                     return Result(all_rows=[])
                 if "INSERT INTO ai_observation_jobs" in query:
                     self.inserted.append(params[2])
@@ -271,6 +370,84 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("FOR UPDATE OF j,w SKIP LOCKED", select)
         self.assertTrue(any("SET last_ai_worker_at" in query for query in db.queries))
         self.assertEqual(db.commits, 1)
+
+    def test_failed_continuous_analysis_refunds_both_quota_counters(self):
+        class Result:
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class DB:
+            def __init__(self):
+                self.requests = 0
+                self.continuous_requests = 0
+                self.input_tokens = 0
+                self.output_tokens = 0
+                self.audits = []
+                self.reservation_sql = ""
+
+            def execute(self, query, params=()):
+                if "SELECT plan,status,permissions FROM organizations" in query:
+                    return Result({"plan": "Base", "status": "active", "permissions": {}})
+                if "SELECT state FROM tenant_workspaces" in query:
+                    return Result({"state": {"leads": [{"id": "lead-1"}]}})
+                if "INSERT INTO ai_usage_daily" in query:
+                    self.reservation_sql = query
+                    self.requests += 1
+                    self.continuous_requests += 1
+                    return Result({"requests": self.requests,
+                                   "continuous_requests": self.continuous_requests})
+                if "SET requests=GREATEST(requests-1,0)" in query:
+                    self.requests = max(0, self.requests - 1)
+                    self.continuous_requests = max(0, self.continuous_requests - 1)
+                    self.input_tokens += params[0]
+                    self.output_tokens += params[1]
+                if "ai.analysis.continuous_failed" in query:
+                    self.audits.append(json.loads(params[1]))
+                return Result()
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        cases = [
+            ("provider", worker.ai_service.AIError("Indisponível", "provider_unavailable", 502), 0, 0),
+            ("invalid_output", {"usage": {"input_tokens": 13, "output_tokens": 5}, "output": []}, 13, 5),
+            ("unexpected", RuntimeError("Falha interna"), 0, 0),
+        ]
+        for name, outcome, input_tokens, output_tokens in cases:
+            with self.subTest(name=name):
+                db = DB()
+                job = {"id": "job-1", "organization_id": "org-1", "lead_id": "lead-1",
+                       "trigger": "entry", "input_hash": "hash", "attempts": 1}
+
+                def provider(_request):
+                    self.assertEqual((db.requests, db.continuous_requests), (1, 1))
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                with patch.object(worker.ai_service, "observation_policy",
+                                  return_value={"enabled": True, "column": {}}), \
+                     patch.object(worker.ai_service, "build_context", return_value={"lead": {}}), \
+                     patch.object(worker.ai_service, "context_hash", return_value="hash"), \
+                     patch.object(worker.ai_service, "provider_request", return_value={"model": "test"}), \
+                     patch.object(worker.ai_service, "call_provider", side_effect=provider):
+                    if name == "unexpected":
+                        with self.assertRaises(RuntimeError):
+                            worker.process_ai_job(db, job, self.now)
+                    else:
+                        self.assertEqual(worker.process_ai_job(db, job, self.now), "retry")
+                self.assertIn("WHERE ai_usage_daily.requests < %s", db.reservation_sql)
+                self.assertIn("ai_usage_daily.continuous_requests < %s", db.reservation_sql)
+                self.assertEqual((db.requests, db.continuous_requests), (0, 0))
+                self.assertEqual((db.input_tokens, db.output_tokens), (input_tokens, output_tokens))
+                self.assertEqual(len(db.audits), 1)
+                self.assertEqual(db.audits[0]["job_id"], "job-1")
 
     def test_batch_returns_cleanly_when_another_scheduler_holds_lock(self):
         class Result:

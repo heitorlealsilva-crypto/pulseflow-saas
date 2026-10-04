@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import re
 import uuid
@@ -38,10 +39,56 @@ def timestamp(value):
         return float(value) / (1000 if abs(float(value)) > 10_000_000_000 else 1)
     if isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
         except ValueError:
             return None
     return None
+
+
+def memory_retention_days(workspace):
+    ai_config = workspace.get("ai") if isinstance(workspace.get("ai"), dict) else {}
+    try:
+        return min(730, max(7, int(ai_config.get("memoryRetentionDays") or 180)))
+    except (TypeError, ValueError, OverflowError):
+        return 180
+
+
+def prune_ai_memories(workspace, now):
+    """Remove expired or ineligible conversation summaries from one tenant state.
+
+    This is run during the normal scheduler pass even when no AI job or follow-up
+    is due.  Invalid/undated and orphaned records are removed rather than kept
+    forever.  It does not touch the original conversation or call history.
+    """
+    ai_config = workspace.get("ai")
+    if not isinstance(ai_config, dict) or "memories" not in ai_config:
+        return False
+    original = ai_config["memories"]
+    if not isinstance(original, list):
+        ai_config["memories"] = []
+        return True
+    now_ts = now.timestamp()
+    cutoff = now_ts - memory_retention_days(workspace) * 86400
+    raw_leads = workspace.get("leads")
+    allowed_leads = {
+        str(lead.get("id")) for lead in (raw_leads if isinstance(raw_leads, list) else [])
+        if isinstance(lead, dict) and lead.get("id")
+        and not lead.get("optOut") and not lead.get("doNotContact")
+    }
+    retained = []
+    for memory in original:
+        if not isinstance(memory, dict) or str(memory.get("leadId") or "") not in allowed_leads:
+            continue
+        at = timestamp(memory.get("at"))
+        if at is None or not math.isfinite(at) or at < cutoff or at > now_ts + 86400:
+            continue
+        retained.append(memory)
+    retained = retained[-500:]
+    if retained == original:
+        return False
+    ai_config["memories"] = retained
+    return True
 
 
 def can_contact(lead):
@@ -428,6 +475,28 @@ def reserve_continuous_usage(db, organization_id, plan, today):
          ai_service.continuous_limit(plan))).fetchone()
 
 
+def release_continuous_usage(db, job, error_code):
+    """Refund an uncompleted observation while retaining known provider tokens."""
+    usage_date = job.get("_quota_reserved_day")
+    if usage_date is None:
+        return
+    db.rollback()
+    input_tokens, output_tokens = ai_service.response_usage_tokens(job.get("_quota_response"))
+    db.execute("""UPDATE ai_usage_daily SET requests=GREATEST(requests-1,0),
+        continuous_requests=GREATEST(continuous_requests-1,0),
+        input_tokens=input_tokens+%s,output_tokens=output_tokens+%s,updated_at=NOW()
+        WHERE organization_id=%s AND usage_date=%s""",
+        (input_tokens, output_tokens, job["organization_id"], usage_date))
+    db.execute("""INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata)
+        VALUES(NULL,%s,'ai.analysis.continuous_failed',%s::jsonb)""",
+        (job["organization_id"], json.dumps({"job_id": str(job["id"]),
+          "lead_id": str(job["lead_id"]), "code": error_code})))
+    db.commit()
+    job.pop("_quota_reserved_day", None)
+    job.pop("_quota_response", None)
+    job.pop("_quota_error_code", None)
+
+
 def claim_ai_job(db, now):
     # A function timeout must not leave a job permanently locked in "running".
     db.execute("""UPDATE ai_observation_jobs SET status='retry',not_before=%s,
@@ -496,7 +565,7 @@ def _approval_from_analysis(analysis_id, lead, result, job, now):
     }
 
 
-def process_ai_job(db, job, now):
+def _process_ai_job_unprotected(db, job, now):
     """Analyze one claimed job. Provider failures are isolated to this job."""
     account = db.execute("SELECT plan,status,permissions FROM organizations WHERE id=%s",
                          (job["organization_id"],)).fetchone()
@@ -519,18 +588,21 @@ def process_ai_job(db, job, now):
     if ai_service.context_hash(context) != job["input_hash"]:
         finish_ai_job(db, job["id"], "skipped", "stale_input")
         return "skipped"
+    request_payload = ai_service.provider_request(
+        context, job["organization_id"], f"worker:{job['lead_id']}")
     reserved = reserve_continuous_usage(db, job["organization_id"], account.get("plan") or "Base", now.date())
     if not reserved:
         tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
         finish_ai_job(db, job["id"], "retry", "continuous_daily_limit", tomorrow)
         return "deferred"
-    request_payload = ai_service.provider_request(
-        context, job["organization_id"], f"worker:{job['lead_id']}")
     db.commit()
+    job["_quota_reserved_day"] = now.date()
     try:
         response = ai_service.call_provider(request_payload)
+        job["_quota_response"] = response
         result = ai_service.enforce_safety(ai_service.extract_analysis(response), lead)
     except ai_service.AIError as error:
+        job["_quota_error_code"] = error.code
         return _retry_ai_job(db, job, error.code, now)
 
     # Revalidate after the network call; stale advice is never presented.
@@ -541,6 +613,7 @@ def process_ai_job(db, job, now):
                          if str(item.get("id")) == str(job["lead_id"])), None)
     if not current_lead:
         db.rollback()
+        job["_quota_error_code"] = "lead_removed"
         finish_ai_job(db, job["id"], "skipped", "lead_removed")
         return "skipped"
     current_policy = ai_service.observation_policy(current, current_lead)
@@ -549,16 +622,16 @@ def process_ai_job(db, job, now):
     if (not current_policy["enabled"] or ai_service.context_hash(current_context) != job["input_hash"]
             or current_lead.get("optOut") or current_lead.get("doNotContact")):
         db.rollback()
+        job["_quota_error_code"] = "stale_input"
         finish_ai_job(db, job["id"], "skipped", "stale_input")
         return "skipped"
     result = ai_service.enforce_safety(result, current_lead)
     analysis_id = str(uuid.uuid4())
-    usage = response.get("usage") or {}
+    input_tokens, output_tokens = ai_service.response_usage_tokens(response)
     db.execute("""UPDATE ai_usage_daily SET input_tokens=input_tokens+%s,
         output_tokens=output_tokens+%s,updated_at=NOW()
         WHERE organization_id=%s AND usage_date=%s""",
-        (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
-         job["organization_id"], now.date()))
+        (input_tokens, output_tokens, job["organization_id"], now.date()))
     db.execute("""INSERT INTO ai_analyses(
             id,organization_id,lead_id,actor_user_id,model,result,input_hash,source,trigger)
         VALUES(%s,%s,%s,NULL,%s,%s::jsonb,%s,'continuous',%s)""",
@@ -568,18 +641,8 @@ def process_ai_job(db, job, now):
 
     ai_config = current.get("ai") or {}
     if ai_config.get("learningEnabled"):
-        try:
-            retention_days = min(730, max(7, int(ai_config.get("memoryRetentionDays") or 180)))
-        except (TypeError, ValueError):
-            retention_days = 180
-        cutoff = now - timedelta(days=retention_days)
-        memories = []
-        for memory in ai_config.get("memories", []):
-            if not isinstance(memory, dict):
-                continue
-            memory_at = timestamp(memory.get("at"))
-            if memory_at is not None and memory_at >= cutoff.timestamp():
-                memories.append(memory)
+        prune_ai_memories(current, now)
+        memories = list(ai_config.get("memories", []))
         memories.append({
             "id": analysis_id,
             "leadId": str(current_lead["id"]),
@@ -623,6 +686,22 @@ def process_ai_job(db, job, now):
         error_code=NULL,updated_at=NOW() WHERE id=%s""", (job["id"],))
     db.commit()
     return "completed"
+
+
+def process_ai_job(db, job, now):
+    """Balance every committed quota reservation, including unexpected failures."""
+    try:
+        status = _process_ai_job_unprotected(db, job, now)
+    except Exception:
+        release_continuous_usage(db, job, str(job.get("_quota_error_code") or "analysis_failed"))
+        raise
+    if status != "completed":
+        release_continuous_usage(db, job, str(job.get("_quota_error_code") or status))
+    else:
+        job.pop("_quota_reserved_day", None)
+        job.pop("_quota_response", None)
+        job.pop("_quota_error_code", None)
+    return status
 
 
 def process_ai_jobs(db, now, limit=MAX_AI_ANALYSES_PER_RUN):
@@ -701,19 +780,16 @@ def run_batch(db, now=None, limit=MAX_TENANTS_PER_RUN):
                 continue
             scanned += 1
             workspace = row.get("state") if isinstance(row.get("state"), dict) else {}
-            ai_config = workspace.get("ai") if isinstance(workspace.get("ai"), dict) else {}
-            try:
-                retention_days = min(730, max(7, int(ai_config.get("memoryRetentionDays") or 180)))
-            except (TypeError, ValueError):
-                retention_days = 180
+            retention_days = memory_retention_days(workspace)
             db.execute("""DELETE FROM ai_analyses WHERE organization_id=%s
                 AND created_at < %s""",
                 (row["organization_id"], now - timedelta(days=retention_days)))
+            memories_pruned = prune_ai_memories(workspace, now)
             tenant_created = 0
             for action in collect_due_actions(workspace, now):
                 if materialize_action(db, row["organization_id"], workspace, action, now):
                     tenant_created += 1
-            if tenant_created:
+            if tenant_created or memories_pruned:
                 db.execute("""
                     UPDATE tenant_workspaces SET state=%s::jsonb,revision=revision+1,updated_at=NOW()
                     WHERE organization_id=%s

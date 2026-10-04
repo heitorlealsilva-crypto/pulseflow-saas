@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from api import integration_events
 
 MAX_BODY_BYTES = 2_000_000
-LEGAL_VERSION = "2026-09-20"
+LEGAL_VERSION = "2026-10-03"
 PERMISSIONS = ("workspace_read", "workspace_write", "manage_settings", "whatsapp_read", "whatsapp_send", "whatsapp_manage")
 WORKSPACE_TYPES = {
     "leads": list, "columns": list, "postSaleColumns": list, "cadence": list,
@@ -34,6 +34,7 @@ WORKSPACE_TYPES = {
 SETTINGS_FIELDS = {"columns", "postSaleColumns", "cadence", "automations", "whatsapp", "businessProfile", "settings", "integrations", "templates"}
 AI_RUNTIME_FIELDS = {"memories", "feedback", "lastLearnedAt"}
 SECRET_FIELDS = {"password", "passwordhash", "token", "accesstoken", "refreshtoken", "appsecret", "verifytoken", "apikey", "secret", "authorization", "cookie", "session", "credentials", "accesstokenenc", "appsecretenc"}
+PRIVACY_REQUEST_SCOPES = {"meta_data", "own_account", "organization", "other"}
 _SCHEMA_READY_FOR = None
 
 
@@ -125,7 +126,27 @@ def ensure_schema(db):
         CREATE TABLE IF NOT EXISTS auth_rate_limits (
             bucket_hash TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 1,
             resets_at TIMESTAMPTZ NOT NULL)
-    """, "CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry_idx ON auth_rate_limits(resets_at)"]
+    """, "CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry_idx ON auth_rate_limits(resets_at)", """
+        CREATE TABLE IF NOT EXISTS privacy_requests (
+            id UUID PRIMARY KEY,
+            organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+            requester_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+            source TEXT NOT NULL CHECK (source IN ('public', 'authenticated')),
+            scope TEXT NOT NULL CHECK (scope IN ('meta_data', 'own_account', 'organization', 'other')),
+            contact_email TEXT NOT NULL,
+            organization_name TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK
+                (status IN ('pending', 'acknowledged', 'needs_verification', 'verified', 'resolved', 'rejected')),
+            identity_verified_at TIMESTAMPTZ,
+            acknowledged_at TIMESTAMPTZ,
+            verification_note TEXT NOT NULL DEFAULT '',
+            resolution_note TEXT NOT NULL DEFAULT '',
+            resolved_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())
+    """, "CREATE INDEX IF NOT EXISTS privacy_requests_status_idx ON privacy_requests(status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS privacy_requests_user_idx ON privacy_requests(requester_user_id, created_at DESC)"]
     for statement in statements:
         db.execute(statement)
     integration_events.ensure_schema(db)
@@ -313,9 +334,11 @@ class handler(BaseHTTPRequestHandler):
             return "unknown"
 
     def rate_limit(self, db, action, email=""):
-        buckets = [(f"{action}:ip:{self.client_ip()}", 60 if action == "login" else 10)]
+        buckets = [(f"{action}:ip:{self.client_ip()}", 60 if action == "login" else 5 if action == "privacy_request" else 10)]
         if action == "login":
             buckets.append((f"login:email:{email}", 8))
+        elif action == "privacy_request" and email:
+            buckets.append((f"privacy_request:email:{email}", 3))
         denied = False
         seconds = 900 if action == "login" else 3600
         for raw_key, maximum in buckets:
@@ -357,6 +380,20 @@ class handler(BaseHTTPRequestHandler):
                     audits = db.execute("SELECT a.id,a.action,a.metadata,a.created_at,a.organization_id,o.name AS organization_name,u.name AS actor_name FROM audit_logs a LEFT JOIN organizations o ON o.id=a.organization_id LEFT JOIN users u ON u.id=a.actor_user_id ORDER BY a.created_at DESC LIMIT 100").fetchall()
                     return self.reply(200, {"ok": True, "accounts": accounts, "users": users, "audits": audits,
                                            "summary": {"accounts": len(accounts), "users": len(users), "active": sum(item["status"] == "active" for item in users)}})
+                if action == "admin-privacy-requests":
+                    if user["role"] != "super_admin":
+                        raise RequestError("acesso restrito", 403)
+                    requests = db.execute("""SELECT id,organization_id,requester_user_id,source,scope,contact_email,
+                        organization_name,details,status,identity_verified_at,acknowledged_at,verification_note,resolution_note,
+                        resolved_at,created_at,updated_at FROM privacy_requests
+                        ORDER BY CASE WHEN status IN ('resolved','rejected') THEN 1 ELSE 0 END,
+                        created_at DESC LIMIT 200""").fetchall()
+                    return self.reply(200, {"ok": True, "requests": requests})
+                if action == "privacy-requests":
+                    requests = db.execute("""SELECT id,scope,status,created_at,updated_at,resolved_at
+                        FROM privacy_requests WHERE requester_user_id=%s
+                        ORDER BY created_at DESC LIMIT 50""", (user["id"],)).fetchall()
+                    return self.reply(200, {"ok": True, "requests": requests})
                 if action == "team":
                     organization_id = self.allowed_organization(user, self.requested_organization())
                     if not organization_id:
@@ -396,6 +433,8 @@ class handler(BaseHTTPRequestHandler):
                 action = self.action()
                 if action in ("register", "login"):
                     return self.authenticate(db, action, payload)
+                if action == "privacy-request-public":
+                    return self.create_privacy_request(db, payload)
                 if action == "accept-invite":
                     return self.accept_invite(db, payload)
                 if action == "accept-password-reset":
@@ -411,6 +450,12 @@ class handler(BaseHTTPRequestHandler):
                     raise RequestError("não autenticado", 401)
                 if action == "workspace":
                     return self.save_workspace(db, user, payload)
+                if action == "privacy-request":
+                    return self.create_privacy_request(db, payload, user)
+                if action == "admin-privacy-request":
+                    if user["role"] != "super_admin":
+                        raise RequestError("acesso restrito", 403)
+                    return self.update_privacy_request(db, user, payload)
                 if action == "team-user":
                     return self.manage_team_user(db, user, payload)
                 if action == "team-invite":
@@ -432,6 +477,111 @@ class handler(BaseHTTPRequestHandler):
             return self.reply(409, {"ok": False, "error": "e-mail já cadastrado"})
         except Exception:
             return self.reply(503, {"ok": False, "error": "serviço indisponível"})
+
+    def create_privacy_request(self, db, payload, user=None):
+        scope = payload.get("scope")
+        details = payload.get("details", "")
+        if not isinstance(scope, str) or scope not in PRIVACY_REQUEST_SCOPES or not isinstance(details, str) or len(details) > 2000:
+            raise RequestError("pedido de privacidade inválido")
+        if user:
+            if user["role"] == "super_admin":
+                raise RequestError("use uma conta de cliente para este pedido", 403)
+            organization_id = self.allowed_organization(user, "")
+            if not organization_id:
+                raise RequestError("conta não autorizada", 403)
+            if scope in ("meta_data", "organization") and user["role"] != "owner":
+                raise RequestError("somente o proprietário pode solicitar dados de toda a empresa", 403)
+            email = user["email"].strip().lower()
+            company = self.account(db, organization_id)["name"]
+            requester_id = user["id"]
+            source = "authenticated"
+        else:
+            email = payload.get("email", "")
+            company = payload.get("company", "")
+            if not isinstance(email, str) or not isinstance(company, str):
+                raise RequestError("informe seu e-mail e empresa")
+            email = email.strip().lower()
+            company = company.strip()
+            if len(company) > 120:
+                raise RequestError("nome da empresa excede o limite")
+            organization_id = requester_id = None
+            source = "public"
+        if len(email) > 254:
+            raise RequestError("informe um e-mail válido")
+        self.rate_limit(db, "privacy_request", email)
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise RequestError("informe um e-mail válido")
+        request_id = uuid.uuid4()
+        db.execute("""INSERT INTO privacy_requests
+            (id,organization_id,requester_user_id,source,scope,contact_email,organization_name,
+             details,identity_verified_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s THEN NOW() ELSE NULL END)""",
+            (request_id, organization_id, requester_id, source, scope, email, company,
+             details.strip(), bool(user)))
+        if user:
+            self.audit(db, user, organization_id, "privacy.request.created",
+                       {"request_id": str(request_id), "scope": scope})
+        db.commit()
+        return self.reply(201, {"ok": True, "protocol": str(request_id),
+            "message": "Pedido recebido para análise. Nenhuma exclusão foi iniciada automaticamente."})
+
+    def update_privacy_request(self, db, user, payload):
+        if user["role"] != "super_admin":
+            raise RequestError("acesso restrito", 403)
+        try:
+            request_id = str(uuid.UUID(str(payload.get("request_id", ""))))
+        except (ValueError, TypeError, AttributeError):
+            raise RequestError("protocolo inválido")
+        operation = payload.get("operation")
+        if operation not in ("acknowledge", "needs_verification", "verify", "resolve", "reject"):
+            raise RequestError("ação inválida")
+        note = payload.get("note", "")
+        if not isinstance(note, str) or len(note) > 2000:
+            raise RequestError("observação inválida")
+        note = note.strip()
+        if operation in ("verify", "resolve", "reject") and len(note) < 10:
+            raise RequestError("registre uma justificativa com pelo menos 10 caracteres")
+        row = db.execute("""SELECT id,organization_id,scope,status,identity_verified_at
+            FROM privacy_requests WHERE id=%s FOR UPDATE""", (request_id,)).fetchone()
+        if not row:
+            raise RequestError("protocolo não encontrado", 404)
+        if row["status"] in ("resolved", "rejected"):
+            raise RequestError("pedido já encerrado", 409)
+        if operation == "acknowledge":
+            if row["status"] != "pending":
+                raise RequestError("pedido já reconhecido", 409)
+            db.execute("""UPDATE privacy_requests SET status='acknowledged',
+                acknowledged_at=NOW(),updated_at=NOW() WHERE id=%s""", (request_id,))
+            status = "acknowledged"
+        elif operation == "needs_verification":
+            if row["status"] not in ("pending", "acknowledged"):
+                raise RequestError("transição de pedido inválida", 409)
+            db.execute("""UPDATE privacy_requests SET status='needs_verification',
+                acknowledged_at=COALESCE(acknowledged_at,NOW()),updated_at=NOW() WHERE id=%s""", (request_id,))
+            status = "needs_verification"
+        elif operation == "verify":
+            if row["status"] not in ("pending", "acknowledged", "needs_verification"):
+                raise RequestError("transição de pedido inválida", 409)
+            db.execute("""UPDATE privacy_requests SET status='verified',
+                identity_verified_at=NOW(),verification_note=%s,
+                acknowledged_at=COALESCE(acknowledged_at,NOW()),updated_at=NOW() WHERE id=%s""",
+                (note, request_id))
+            status = "verified"
+        elif operation == "resolve":
+            if not row["identity_verified_at"] or row["status"] == "needs_verification":
+                raise RequestError("verifique a identidade antes de encerrar o pedido", 409)
+            db.execute("""UPDATE privacy_requests SET status='resolved',resolution_note=%s,
+                resolved_at=NOW(),updated_at=NOW() WHERE id=%s""", (note, request_id))
+            status = "resolved"
+        else:
+            db.execute("""UPDATE privacy_requests SET status='rejected',resolution_note=%s,
+                resolved_at=NOW(),updated_at=NOW() WHERE id=%s""", (note, request_id))
+            status = "rejected"
+        self.audit(db, user, row["organization_id"], "privacy.request." + operation,
+                   {"request_id": request_id, "scope": row["scope"], "status": status})
+        db.commit()
+        return self.reply(200, {"ok": True, "protocol": request_id, "status": status,
+            "message": "Estado do pedido registrado. O PulseFlow não executou exclusão automática."})
 
     def authenticate(self, db, action, payload):
         email, password = payload.get("email", ""), payload.get("password", "")

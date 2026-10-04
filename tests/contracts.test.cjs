@@ -7,7 +7,7 @@ async function integrationCall(action,{payload,cookie='',bearer='',requestOrigin
  assert.equal((await call('me')).status,401);
  const nonce=Date.now(),password='Fixture-only-Password!';
  assert.equal((await call('register',{name:'Sem aceite',company:'Inválida',email:'no-legal'+nonce+'@example.test',password})).status,400);
- const legal={legal_accepted:true,legal_version:'2026-09-20'},a=await call('register',{name:'Teste A',company:'Tenant A '+nonce,email:'a'+nonce+'@example.test',password,...legal});
+ const legal={legal_accepted:true,legal_version:'2026-10-03'},a=await call('register',{name:'Teste A',company:'Tenant A '+nonce,email:'a'+nonce+'@example.test',password,...legal});
  const b=await call('register',{name:'Teste B',company:'Tenant B '+nonce,email:'b'+nonce+'@example.test',password,...legal});
  assert.equal(a.status,200);assert.equal(b.status,200);
  assert.equal((await call('admin',undefined,a.cookie)).status,403);

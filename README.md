@@ -13,6 +13,7 @@ Ferramenta web de organização e acompanhamento comercial. A proposta é ajudar
 - Importação e exportação de contatos por CSV para integração leve com outros sistemas, sem transformar o PulseFlow em um CRM completo.
 - API de integração por empresa, com chave revogável, escopos, escrita idempotente de contatos, fila de eventos e webhooks de saída assinados para sincronização com outros CRMs.
 - Termos e Política de Privacidade públicos, com aceite versionado gravado no cadastro e no convite de equipe. Os textos do MVP precisam de identificação completa do operador e revisão jurídica antes da comercialização em escala.
+- Página pública para solicitar exclusão de dados com protocolo, limite de abuso e fila exclusiva do administrador. O pedido exige triagem e, conforme o escopo, verificação de identidade; registrar ou encerrar o protocolo **não executa uma exclusão automática**.
 - Configuração por empresa para a integração oficial do WhatsApp. Credenciais permanecem no servidor, criptografadas.
 - Interface adaptada a computador e celular, com recursos avançados concentrados nas configurações.
 
@@ -35,6 +36,8 @@ Quando chega uma resposta oficial, o servidor atualiza o contato, cria um alerta
 ### Planos e serviços externos
 
 Os valores de referência são **Base: R$ 9,90/mês** para uma pessoa e **Equipe: R$ 29,90/mês** para até três usuários ativos. A cobrança, assinatura e cancelamento automático por um processador de pagamento não estão integrados. A alteração de plano pelo administrador é operacional; não efetua uma cobrança.
+
+Não há período de teste grátis com prazo controlado nesta versão. O cadastro cria uma conta operacional; preço, cobrança e suspensão por inadimplência dependem de uma implementação de pagamentos antes da venda em escala.
 
 O consumo do WhatsApp oficial pertence à conta Meta do cliente. O PulseFlow não acrescenta uma mensalidade de API. A ponte genérica por API e CSV está disponível, mas Google Agenda, VoIP e conectores específicos de cada CRM ainda precisam de autorizações próprias; registrar manualmente uma reunião ou ligação não ativa essas integrações.
 
@@ -73,6 +76,12 @@ Variáveis de ambiente:
 Não colocar senhas, tokens ou URLs privadas do banco no JavaScript, no repositório ou em capturas de tela. Trocar a chave de criptografia sem migrar as credenciais existentes impede que elas sejam decifradas. As variáveis administrativas inicializam o administrador; não são uma tela de alteração de senha para usuários existentes.
 
 Sem banco ou dependências, o servidor local informa indisponibilidade. Ele não substitui silenciosamente o banco por um JSON ou por dados de demonstração.
+
+### Pedidos de privacidade no MVP
+
+A página `/#exclusao-de-dados` recebe pedidos públicos sem exigir login. Ela gera um protocolo e não revela se o e-mail pertence a alguma conta. O titular autenticado também pode solicitar pelo sistema; apenas o proprietário pode pedir exclusão de dados da empresa ou da integração Meta inteira. O administrador global vê a fila e registra recebimento, necessidade de confirmação, verificação de identidade, tratamento ou recusa com justificativa e trilha de auditoria. Os detalhes do pedido ficam no banco e não são enviados para webhooks.
+
+**Procedimento operacional obrigatório:** localizar o protocolo, confirmar a identidade e a autoridade do solicitante por um canal seguro, delimitar o escopo, identificar dados e integrações afetados, executar manualmente as ações cabíveis em cada armazenamento/provedor, verificar o resultado e só então registrar a resolução com uma nota. Um status “resolvido” não apaga dados por si só. Não prometer prazo de eliminação ou retenção de backup sem política técnica comprovada. Nunca pedir senha, código de uso único ou token ao titular.
 
 ## Testes de interface isolados
 
