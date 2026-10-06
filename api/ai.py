@@ -32,6 +32,28 @@ DEFAULT_MODEL = "gpt-5.6-luna"
 PLAN_DAILY_LIMITS = {"Base": 10, "Equipe": 100}
 CONTINUOUS_DAILY_LIMITS = {"Base": 3, "Equipe": 30}
 _SCHEMA_READY_FOR = None
+SMOKE_TEST_HOURLY_LIMIT = 3
+SMOKE_TEST_ERRORS = {
+    "ai_not_configured": (503, "A IA ainda não foi ativada pelo administrador."),
+    "provider_rejected": (502, "O provedor recusou o teste de IA."),
+    "provider_unavailable": (502, "O provedor de IA não respondeu ao teste."),
+    "provider_invalid": (502, "O provedor devolveu uma resposta inválida."),
+}
+
+# Fixed fictional input: diagnostics never read or send a tenant's workspace.
+SMOKE_TEST_CONTEXT = {
+    "business": {"niche": "Serviço fictício", "agent_goal": "Avaliar um cenário de teste.",
+                 "tone": "Neutro", "observer_instructions": "", "operator_instructions": "",
+                 "column_observer_instructions": "", "column_operator_instructions": ""},
+    "lead": {"first_name": "Pessoa fictícia", "board": "Principal", "stage": "Novo",
+             "origin": "Teste sintético", "interest": "Serviço fictício", "product": "Plano de exemplo",
+             "niche_and_revenue": "", "notes": "Pessoa fictícia pediu informações gerais.",
+             "call_recorded": False, "post_sale_observation_only": False,
+             "analysis_trigger": "smoke_test"},
+    "recent_conversation": [{"direction": "cliente", "text": "Olá, como funciona o serviço de exemplo?", "at": ""}],
+    "recent_calls": [],
+    "prior_unverified_observations": [],
+}
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -128,6 +150,28 @@ def response_usage_tokens(response):
             return 0
 
     return token_count(usage.get("input_tokens")), token_count(usage.get("output_tokens"))
+
+
+def reserve_smoke_test(db, user_id):
+    """Atomically cap paid diagnostics, including failed provider attempts."""
+    bucket = hashlib.sha256(f"ai-smoke-test:user:{user_id}".encode()).hexdigest()
+    reserved = db.execute("""INSERT INTO auth_rate_limits(bucket_hash,attempts,resets_at)
+        VALUES(%s,1,NOW() + INTERVAL '1 hour')
+        ON CONFLICT(bucket_hash) DO UPDATE SET
+            attempts=CASE WHEN auth_rate_limits.resets_at<=NOW() THEN 1 ELSE auth_rate_limits.attempts+1 END,
+            resets_at=CASE WHEN auth_rate_limits.resets_at<=NOW() THEN EXCLUDED.resets_at ELSE auth_rate_limits.resets_at END
+        WHERE auth_rate_limits.resets_at<=NOW() OR auth_rate_limits.attempts<%s
+        RETURNING attempts""", (bucket, SMOKE_TEST_HOURLY_LIMIT)).fetchone()
+    if not reserved:
+        raise AIError("Limite de testes de IA atingido. Tente novamente mais tarde.", "smoke_test_rate_limited", 429)
+    db.commit()
+
+
+def audit_smoke_test(db, user_id, model, code):
+    db.execute("""INSERT INTO audit_logs(actor_user_id,organization_id,action,metadata)
+        VALUES(%s,NULL,'ai.smoke_test',%s::jsonb)""",
+        (user_id, json.dumps({"model": model, "code": code})))
+    db.commit()
 
 
 def release_manual_usage(db, organization_id, usage_date, user_id, lead_id, error_code, response=None):
@@ -513,11 +557,49 @@ class handler(BaseHTTPRequestHandler):
         except Exception:
             return self.reply(503, {"ok": False, "error": "IA temporariamente indisponível.", "code": "ai_unavailable"})
 
+    def smoke_test(self, payload):
+        with connect() as db:
+            user = session_user(db, self.headers.get("Cookie", ""))
+            if not user:
+                raise AIError("Entre na sua conta novamente.", "unauthenticated", 401)
+            if user.get("role") != "super_admin":
+                raise AIError("Acesso restrito ao administrador da plataforma.", "forbidden", 403)
+            if payload:
+                raise AIError("Este teste não aceita dados de clientes.", "invalid_body", 400)
+
+            reserve_smoke_test(db, user["id"])
+            # Fresh, synthetic identifiers keep even the provider safety identifier
+            # independent of real users and organizations.
+            request_payload = provider_request(SMOKE_TEST_CONTEXT, "pulseflow-smoke-test", str(uuid.uuid4()))
+            model = request_payload["model"]
+            try:
+                response = call_provider(request_payload)
+                if not isinstance(response, dict):
+                    raise AIError("A IA devolveu uma resposta inválida.", "provider_invalid", 502)
+                enforce_safety(extract_analysis(response), SMOKE_TEST_CONTEXT["lead"])
+            except AIError as error:
+                code = error.code if error.code in SMOKE_TEST_ERRORS else "ai_unavailable"
+                status, message = SMOKE_TEST_ERRORS.get(code, (503, "O teste de IA não pôde ser concluído."))
+                audit_smoke_test(db, user["id"], model, code)
+                raise AIError(message, code, status) from None
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                audit_smoke_test(db, user["id"], model, "provider_invalid")
+                raise AIError("A IA devolveu uma resposta inválida.", "provider_invalid", 502) from None
+            except Exception:
+                audit_smoke_test(db, user["id"], model, "ai_unavailable")
+                raise
+            audit_smoke_test(db, user["id"], model, "ok")
+            input_tokens, output_tokens = response_usage_tokens(response)
+            return self.reply(200, {"ok": True, "model": model,
+                "input_tokens": input_tokens, "output_tokens": output_tokens})
+
     def do_POST(self):
         try:
             if not request_origin_allowed(self.headers):
                 raise AIError("Origem não autorizada.", "invalid_origin", 403)
             query, payload = self.query(), self.body()
+            if query.get("action") == "smoke-test":
+                return self.smoke_test(payload)
             if query.get("action") != "analyze":
                 raise AIError("Ação não encontrada.", "not_found", 404)
             with connect() as db:

@@ -141,7 +141,7 @@ function enhanceConversationAI(){if(S.page!=='conversations'||S.chatTab!=='tips'
 async function analyzeLead(){const l=currentLead();if(!l||S.aiLoading)return;S.aiLoading=true;render();try{await flush();const data=await ai('analyze',{organization_id:S.account.id,lead_id:l.id});S.aiAnalysis={leadId:l.id,analysisId:data.analysis_id,analysis:data.analysis};S.aiStatus={...S.aiStatus,used_today:data.used_today,daily_limit:data.daily_limit,remaining_today:Math.max(0,data.daily_limit-data.used_today)};if(S.workspace.ai.learningEnabled){S.workspace.ai.memories.push({id:data.analysis_id,leadId:l.id,leadName:l.name,summary:data.analysis.summary,signals:data.analysis.signals,at:new Date().toISOString(),source:'openai'});S.workspace.ai.memories=S.workspace.ai.memories.slice(-500)}if(data.analysis.suggested_message&&!S.workspace.manualApprovals.some(a=>a.id===data.analysis_id)){S.workspace.manualApprovals.unshift({id:data.analysis_id,leadId:l.id,leadName:l.name,status:'pending',createdAt:new Date().toISOString(),title:'Sugestão da IA',summary:data.analysis.follow_up_reason,text:data.analysis.suggested_message})}changed();await flush();toast('Análise concluída. Revise a sugestão antes de agir.')}catch(error){toast(error.message,true)}finally{S.aiLoading=false;render()}}
 function renderAssignees(){for(const card of $$('[data-drag]')){const lead=S.workspace.leads.find(item=>item.id===card.dataset.drag),member=(S.team?.members||[]).find(item=>item.id===lead?.assigneeId);if(member)card.querySelector('.tags')?.insertAdjacentHTML('beforeend',`<span class="pill green">${icon('leads')} ${esc(member.name)}</span>`)}}
 function renderAdminResetButtons(){if(S.page!=='admin')return;for(const button of $$('[data-user-status][data-status="suspended"]'))button.insertAdjacentHTML('afterend',`<button class="text-button" data-reset-user="${esc(button.dataset.userStatus)}">Redefinir senha</button>`)}
-function render(){if(!S.user)return login();app.innerHTML=shell(({home,leads,conversations,agenda,automations,settings,cadence,admin}[S.page]||home)());saveStatus();renderAlerts();renderAssignees();renderAdminResetButtons();renderAdminPrivacyPanel();renderIntegrationApiPanel();renderColumnAutomationOverview();renderColumnAutomationSummaries();enhanceConversationAI();enhanceManualConversation();if(S.page==='conversations')$('#messages')?.scrollTo(0,999999);if(S.page==='settings'){updateNicheField();enhanceChannelChoice()}}
+function render(){if(!S.user)return login();app.innerHTML=shell(({home,leads,conversations,agenda,automations,settings,cadence,admin}[S.page]||home)());saveStatus();renderAlerts();renderAssignees();renderAdminResetButtons();renderAdminAIDiagnosticPanel();renderAdminPrivacyPanel();renderIntegrationApiPanel();renderColumnAutomationOverview();renderColumnAutomationSummaries();enhanceConversationAI();enhanceManualConversation();if(S.page==='conversations')$('#messages')?.scrollTo(0,999999);if(S.page==='settings'){updateNicheField();enhanceChannelChoice()}}
 const officialSendingSelected=()=>S.connection?.ready&&S.workspace.whatsapp.mode!=='manual';
 function enhanceChannelChoice(){
  if(S.settingsTab!=='channel')return;
@@ -260,6 +260,10 @@ setInterval(()=>{if(!document.hidden&&S.account&&processDueReviews()){changed();
 function syncCadenceDraft(){const f=$('#cadence-form');if(!f)return;const v=Object.fromEntries(new FormData(f));S.workspace.cadence=S.workspace.cadence.map((s,i)=>({...s,delay:Number(v['delay-'+i])||0,unit:v['unit-'+i]||s.unit,text:v['text-'+i]??s.text}))}
 const privacyScopeLabels={meta_data:'Dados vinculados à Meta',own_account:'Minha conta',organization:'Dados da empresa',other:'Outro pedido'};
 const privacyStatusLabels={pending:'Recebida',acknowledged:'Em análise',needs_verification:'Verificação pendente',verified:'Identidade verificada',resolved:'Atendimento registrado',rejected:'Pedido recusado'};
+function renderAdminAIDiagnosticPanel(){
+ if(S.page!=='admin'||S.user?.role!=='super_admin')return;
+ $('.admin-metrics')?.insertAdjacentHTML('afterend',`<section class="panel spaced" id="admin-ai-diagnostic"><div class="section-heading"><div><h2>Diagnóstico da IA</h2><p>Teste a conexão com um caso fictício. Nenhuma conversa ou dado de cliente será enviado.</p></div>${button('Testar conexão com IA','ai-smoke-test','secondary')}</div><p id="admin-ai-smoke-result" class="fine-print" role="status">Este teste não cria análises nem altera a conta dos clientes.</p></section>`);
+}
 function renderAdminPrivacyPanel(){
  if(S.page!=='admin')return;
  const data=S.adminPrivacy||{requests:[],error:'Carregando solicitações…'},requests=Array.isArray(data.requests)?data.requests:[];
@@ -296,6 +300,22 @@ document.addEventListener('submit',async e=>{
 },true);
 window.addEventListener('hashchange',()=>{const hash=location.hash.slice(1);if(['termos','privacidade','exclusao-de-dados'].includes(hash)){legalPage(hash);return}if($('.legal-page')){if(S.user)render();else void boot()}});
 document.addEventListener('click',async event=>{
+ const trigger=event.target.closest('[data-action="ai-smoke-test"]');
+ if(!trigger)return;
+ event.preventDefault();event.stopImmediatePropagation();
+ if(S.user?.role!=='super_admin')return toast('Este diagnóstico é restrito ao administrador.',true);
+ const result=$('#admin-ai-smoke-result');trigger.disabled=true;
+ if(result)result.textContent='Verificando a conexão com dados fictícios…';
+ try{
+  await ai('smoke-test',{});
+  if(result)result.textContent='Conexão com a IA verificada. Nenhum contato real foi analisado.';
+  toast('IA conectada. Teste fictício concluído.');
+ }catch(cause){
+  if(result)result.textContent='Não foi possível concluir o teste: '+cause.message;
+  toast(cause.message,true);
+ }finally{trigger.disabled=false}
+},true);
+document.addEventListener('click',async event=>{
  const trigger=event.target.closest('[data-action="manual-number"], [data-action="number"], [data-action="manual-mode"], [data-action="official-mode"], [data-action="manual-reply"]');
  if(!trigger)return;
  event.preventDefault();event.stopImmediatePropagation();
@@ -325,8 +345,9 @@ document.addEventListener('submit',async event=>{
   const lead=currentLead(),text=String(new FormData(form).get('text')||'').trim();
   if(!lead||!text)throw new Error('Escreva a resposta recebida.');
   const at=new Date().toISOString(),columns=lead.board==='Pós-venda'?S.workspace.postSaleColumns:S.workspace.columns,column=columns.find(item=>item.id===lead.stage),pauseOnReply=column?.automations?.pauseOnReply!==false;
-  lead.messages.push({id:id(),direction:'in',body:text,at,status:'recorded_manual'});
-  lead.last=text.slice(0,1000);lead.lastReplyAt=at;lead.lastContactAt=at;
+  const messageId=id();
+  lead.messages.push({id:messageId,direction:'in',body:text,at,status:'recorded_manual'});
+  lead.last=text.slice(0,1000);lead.lastReplyId=messageId;lead.lastReplyAt=at;lead.lastContactAt=at;
   if(pauseOnReply){lead.automationPaused=true;for(const approval of S.workspace.manualApprovals||[])if(approval.leadId===lead.id&&['pending','reviewing'].includes(approval.status)&&approval.kind!=='appointment'){approval.status='superseded';approval.supersededAt=at;approval.supersededReason='reply_received'}}
   learnFromConversation(lead,text,'in');processAutomations('reply_received',lead);processDueReviews();changed();await flush();closeDialog();render();toast('Resposta registrada manualmente. Revise o próximo passo com o cliente.');
  }catch(cause){if(error)error.textContent=cause.message;else toast(cause.message,true)}finally{if(submit)submit.disabled=false}
