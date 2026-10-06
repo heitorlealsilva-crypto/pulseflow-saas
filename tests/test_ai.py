@@ -99,6 +99,25 @@ class AITests(unittest.TestCase):
                 self.assertEqual(captured.exception.code, expected)
                 self.assertNotIn("secret details", str(captured.exception))
 
+    def test_latest_provider_check_exposes_only_known_status(self):
+        class CheckDB:
+            def __init__(self, row):
+                self.row = row
+
+            def execute(self, query):
+                if "ai.smoke_test" not in query:
+                    raise AssertionError("Expected only the diagnostic audit query")
+                return self
+
+            def fetchone(self):
+                return self.row
+
+        self.assertEqual(ai.latest_provider_check(CheckDB({"metadata": {"code": "provider_billing_required", "model": "private"}})),
+                         {"code": "provider_billing_required"})
+        self.assertEqual(ai.latest_provider_check(CheckDB({"metadata": {"code": "untrusted_code"}})),
+                         {"code": "unverified"})
+        self.assertEqual(ai.latest_provider_check(CheckDB(None)), {"code": "unverified"})
+
     @staticmethod
     def smoke_endpoint(payload=None):
         endpoint = ai.handler.__new__(ai.handler)

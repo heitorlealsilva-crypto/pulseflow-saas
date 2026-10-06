@@ -181,6 +181,16 @@ def audit_smoke_test(db, user_id, model, code):
     db.commit()
 
 
+def latest_provider_check(db):
+    """Expose only the last sanitized platform diagnostic to signed-in tenants."""
+    row = db.execute("""SELECT metadata FROM audit_logs
+        WHERE action='ai.smoke_test' AND organization_id IS NULL
+        ORDER BY created_at DESC LIMIT 1""").fetchone() or {}
+    metadata = row.get("metadata") if isinstance(row, dict) else None
+    code = metadata.get("code") if isinstance(metadata, dict) else None
+    return {"code": code if code == "ok" or code in SMOKE_TEST_ERRORS else "unverified"}
+
+
 def release_manual_usage(db, organization_id, usage_date, user_id, lead_id, error_code, response=None):
     """Return a failed request's reserved slot without losing known token costs."""
     db.rollback()
@@ -586,6 +596,7 @@ class handler(BaseHTTPRequestHandler):
                 limit = plan_limit(account.get("plan") if account else "Base")
                 return self.reply(200, {"ok": True, "configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
                     "model": os.getenv("OPENAI_MODEL", DEFAULT_MODEL), "mode": "suggest_only",
+                    "provider_check": latest_provider_check(db),
                     "used_today": usage["requests"], "daily_limit": limit,
                     "remaining_today": max(0, limit - usage["requests"])})
         except AIError as error:
