@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from api import ai
@@ -74,6 +76,29 @@ def sample_analysis(**changes):
 
 
 class AITests(unittest.TestCase):
+    def test_provider_rejection_exposes_only_safe_error_category(self):
+        cases = [
+            (401, "invalid_api_key", "provider_authentication"),
+            (403, "permission_denied", "provider_access_denied"),
+            (429, "credit_balance_exhausted", "provider_billing_required"),
+            (429, "project_spend_limit_exceeded", "provider_spend_limit"),
+            (429, "rate_limit_exceeded", "provider_rate_limited"),
+            (400, "invalid_request_error", "provider_invalid_request"),
+            (404, "model_not_found", "provider_model_unavailable"),
+            (503, "server_is_overloaded", "provider_unavailable"),
+        ]
+        for status, provider_code, expected in cases:
+            with self.subTest(status=status, provider_code=provider_code):
+                raw = json.dumps({"error": {"code": provider_code, "message": "secret details"}}).encode()
+                rejection = urllib.error.HTTPError("https://api.openai.com/v1/responses", status,
+                                                    "provider response", {}, io.BytesIO(raw))
+                with patch.object(ai.os, "getenv", return_value="synthetic-test-key"), \
+                     patch.object(ai.urllib.request, "urlopen", side_effect=rejection):
+                    with self.assertRaises(ai.AIError) as captured:
+                        ai.call_provider({"model": "synthetic-model"})
+                self.assertEqual(captured.exception.code, expected)
+                self.assertNotIn("secret details", str(captured.exception))
+
     @staticmethod
     def smoke_endpoint(payload=None):
         endpoint = ai.handler.__new__(ai.handler)

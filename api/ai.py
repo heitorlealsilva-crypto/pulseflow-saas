@@ -36,6 +36,13 @@ SMOKE_TEST_HOURLY_LIMIT = 3
 SMOKE_TEST_ERRORS = {
     "ai_not_configured": (503, "A IA ainda não foi ativada pelo administrador."),
     "provider_rejected": (502, "O provedor recusou o teste de IA."),
+    "provider_authentication": (502, "A chave de IA foi recusada. Verifique a credencial no servidor."),
+    "provider_access_denied": (502, "A conta de IA não tem acesso a esta operação."),
+    "provider_billing_required": (502, "A conta de IA está sem créditos ou faturamento ativo."),
+    "provider_spend_limit": (502, "A conta de IA atingiu o limite de gastos ou uso."),
+    "provider_rate_limited": (503, "A conta de IA atingiu um limite temporário de requisições."),
+    "provider_invalid_request": (502, "A configuração do pedido de IA foi recusada."),
+    "provider_model_unavailable": (502, "O modelo de IA configurado não está disponível para esta conta."),
     "provider_unavailable": (502, "O provedor de IA não respondeu ao teste."),
     "provider_invalid": (502, "O provedor devolveu uma resposta inválida."),
 }
@@ -430,6 +437,35 @@ def provider_request(context, organization_id, user_id):
     }
 
 
+def classify_provider_http_error(error):
+    """Report only actionable error categories, never provider text or credentials."""
+    status = int(error.code or 0)
+    provider_code = ""
+    try:
+        payload = json.loads(error.read(4096))
+        details = payload.get("error") if isinstance(payload, dict) else None
+        provider_code = str(details.get("code") or "") if isinstance(details, dict) else ""
+    except (ValueError, TypeError, UnicodeDecodeError, OSError):
+        pass
+    if status == 401:
+        return AIError("A chave de IA foi recusada. Verifique a credencial no servidor.", "provider_authentication", 502)
+    if status == 403:
+        return AIError("A conta de IA não tem acesso a esta operação.", "provider_access_denied", 502)
+    if status == 429:
+        if provider_code in {"credit_balance_exhausted", "insufficient_quota"}:
+            return AIError("A conta de IA está sem créditos ou faturamento ativo.", "provider_billing_required", 502)
+        if provider_code in {"organization_spend_limit_exceeded", "project_spend_limit_exceeded", "organization_usage_limit_exceeded"}:
+            return AIError("A conta de IA atingiu o limite de gastos ou uso.", "provider_spend_limit", 502)
+        return AIError("A conta de IA atingiu um limite temporário de requisições.", "provider_rate_limited", 503)
+    if status == 404:
+        return AIError("O modelo de IA configurado não está disponível para esta conta.", "provider_model_unavailable", 502)
+    if status == 400:
+        return AIError("A configuração do pedido de IA foi recusada.", "provider_invalid_request", 502)
+    if status >= 500:
+        return AIError("O provedor de IA está temporariamente indisponível.", "provider_unavailable", 503)
+    return AIError("A análise não pôde ser concluída agora.", "provider_rejected", 502)
+
+
 def call_provider(payload):
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
@@ -441,7 +477,7 @@ def call_provider(payload):
         with urllib.request.urlopen(request, timeout=30) as response:
             raw = response.read(MAX_PROVIDER_BODY + 1)
     except urllib.error.HTTPError as error:
-        raise AIError("A análise não pôde ser concluída agora.", "provider_rejected", 502) from error
+        raise classify_provider_http_error(error) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise AIError("A IA demorou para responder. Tente novamente.", "provider_unavailable", 502) from error
     if len(raw) > MAX_PROVIDER_BODY:
