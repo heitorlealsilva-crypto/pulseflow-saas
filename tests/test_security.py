@@ -297,6 +297,7 @@ class SecurityTests(unittest.TestCase):
     def test_prepared_webhook_is_not_reported_as_credentials(self):
         value=wa.connection_payload({'verify_token_hash':'secret','webhook_verified_at':self.now},self.org)
         self.assertFalse(value['configured']);self.assertTrue(value['webhook_prepared']);self.assertFalse(value['ready'])
+        self.assertFalse(value['setup']['credentials_saved'])
     def test_connection_hides_credentials(self):
         value=wa.connection_payload({'access_token_enc':'secret','verify_token_hash':'secret'},self.org)
         self.assertNotIn('secret',json.dumps(value,default=str))

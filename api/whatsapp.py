@@ -315,7 +315,7 @@ def connection_payload(row, organization_id):
             "connection": public, "groups_supported": False,
             "setup": {
                 "server_ready": encryption_ready,
-                "credentials_saved": bool(row),
+                "credentials_saved": credentials_saved,
                 "meta_verified": meta_verified,
                 "webhook_verified": webhook_verified,
                 "messages_subscribed": messages_subscribed,

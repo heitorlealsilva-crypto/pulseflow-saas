@@ -58,8 +58,75 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(actions[0]["text"], "Oi, Ana!")
         self.assertIn("cadence:lead-1:0", actions[0]["dedupe_key"])
 
+    def test_inactive_principal_lead_is_reviewed_without_ai(self):
+        last_contact = (self.now - timedelta(days=31)).isoformat()
+        lead = self.lead(calls=[self.call], lastContactAt=last_contact)
+        workspace = self.workspace(lead)
+        workspace["settings"] = {"inactiveDays": 30}
+        actions = worker.collect_due_actions(workspace, self.now)
+        self.assertEqual(len(actions), 1)
+        action = actions[0]
+        self.assertEqual(action["kind"], "followup")
+        self.assertEqual(action["title"], "Retomar contato")
+        self.assertEqual(action["dedupe_key"],
+                         f"task:lead-1:Retomar contato:{int((self.now - timedelta(days=1)).timestamp())}")
+        self.assertTrue(action["requires_approval"])
+
+    def test_inactive_reminder_respects_recent_contact_board_pause_and_cadence(self):
+        old = (self.now - timedelta(days=31)).isoformat()
+        due_cadence = {"delay": 40, "unit": "dias", "text": "Aguarde a etapa"}
+        cases = [
+            self.lead(calls=[self.call], lastContactAt=self.past),
+            self.lead(calls=[self.call], lastContactAt=old, board="Remarketing"),
+            self.lead(calls=[self.call], lastContactAt=old, board="Abandonados"),
+            self.lead(calls=[self.call], lastContactAt=old, automationPaused=True),
+            self.lead(calls=[self.call], lastContactAt=old, opt_out=True),
+            self.lead(calls=[self.call], lastContactAt=old, cadenceEnabled=True,
+                      cadenceStarted=old, cadenceIndex=0),
+        ]
+        for lead in cases:
+            with self.subTest(lead=lead):
+                workspace = self.workspace(lead)
+                workspace["settings"] = {"inactiveDays": 30}
+                workspace["cadence"] = [due_cadence]
+                workspace["columns"][0]["limit"] = 0
+                self.assertEqual(worker.collect_due_actions(workspace, self.now), [])
+
+    def test_waiting_deadline_prepares_idempotent_followup_without_ai(self):
+        lead = self.lead(calls=[self.call], stage="waiting")
+        workspace = self.workspace(lead)
+        workspace["columns"] = [{"id": "waiting", "name": "Aguardando resposta",
+                                 "limit": 1}]
+        actions = worker.collect_due_actions(workspace, self.now)
+        self.assertEqual(len(actions), 1)
+        due = self.now - timedelta(hours=2)
+        self.assertEqual(actions[0]["dedupe_key"],
+                         f"task:lead-1:Follow-up:{int(due.timestamp())}")
+        self.assertEqual(actions[0]["kind"], "followup")
+        self.assertTrue(actions[0]["requires_approval"])
+        lead["lastTaskCompletedAt"] = (self.now - timedelta(minutes=30)).isoformat()
+        self.assertEqual(worker.collect_due_actions(workspace, self.now), [])
+
+    def test_other_column_deadline_only_notifies_including_post_sale(self):
+        lead = self.lead(calls=[self.call])
+        workspace = self.workspace(lead)
+        actions = worker.collect_due_actions(workspace, self.now)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["kind"], "column_timeout")
+        self.assertFalse(actions[0]["requires_approval"])
+        self.assertEqual(actions[0]["text"], "")
+        lead.update(board="Pós-venda", stage="renewal", calls=[])
+        workspace["postSaleColumns"] = [{"id": "renewal", "name": "Renovação", "limit": 1}]
+        actions = worker.collect_due_actions(workspace, self.now)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["kind"], "column_timeout")
+        self.assertFalse(actions[0]["requires_approval"])
+        self.assertEqual(actions[0]["text"], "")
+
     def test_opt_out_and_paused_leads_never_queue(self):
-        for extra in ({"optOut": True}, {"automationPaused": True}, {"stage": "closed"}):
+        for extra in ({"optOut": True}, {"doNotContact": True},
+                      {"opt_out": True}, {"automationPaused": True},
+                      {"stage": "closed"}):
             actions = worker.collect_due_actions(self.workspace(self.lead(**extra)), self.now)
             self.assertEqual(actions, [])
 
@@ -92,6 +159,7 @@ class WorkerTests(unittest.TestCase):
     def test_ai_rule_only_runs_for_enabled_tenant_agent(self):
         lead = self.lead(calls=[self.call])
         workspace = self.workspace(lead)
+        workspace["columns"][0]["limit"] = 0
         workspace["automations"] = [{
             "id": "rule-1", "name": "Etapa parada", "enabled": True,
             "trigger": "stage_timeout", "board": "Principal", "delay": 1,
@@ -102,8 +170,48 @@ class WorkerTests(unittest.TestCase):
         actions = worker.collect_due_actions(workspace, self.now)
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0]["kind"], "automation")
-        self.assertEqual(actions[0]["dedupe_key"], "rule-1:lead-1:2026-09-19")
+        self.assertEqual(actions[0]["dedupe_key"],
+                         f"rule-1:lead-1:stage_timeout:{int(worker.timestamp(self.past))}")
         workspace["automationRuns"] = [{"key": actions[0]["dedupe_key"]}]
+        self.assertEqual(worker.collect_due_actions(workspace, self.now), [])
+        self.assertEqual(worker.collect_due_actions(workspace, self.now + timedelta(days=1)), [])
+
+    def test_legacy_pending_rule_prevents_duplicate_after_key_migration(self):
+        lead = self.lead(calls=[self.call])
+        workspace = self.workspace(lead)
+        workspace["ai"]["enabled"] = True
+        workspace["automations"] = [{
+            "id": "rule-1", "name": "Etapa parada", "enabled": True,
+            "trigger": "stage_timeout", "board": "Principal", "delay": 1,
+            "action": "prepare_followup",
+        }]
+        workspace["manualApprovals"] = [{"ruleId": "rule-1", "leadId": "lead-1",
+                                         "status": "pending"}]
+        self.assertEqual(worker.collect_due_actions(workspace, self.now), [])
+        workspace["manualApprovals"][0]["status"] = "dismissed"
+        workspace["automationRuns"] = [{"key": "rule-1:lead-1:2026-09-19",
+                                        "at": self.now.isoformat()}]
+        self.assertEqual(worker.collect_due_actions(workspace, self.now + timedelta(days=1)), [])
+
+    def test_due_custom_inactivity_rule_replaces_generic_review(self):
+        old = (self.now - timedelta(days=31)).isoformat()
+        lead = self.lead(calls=[self.call], lastContactAt=old)
+        workspace = self.workspace(lead)
+        workspace["settings"] = {"inactiveDays": 30}
+        workspace["columns"][0]["limit"] = 0
+        workspace["ai"]["enabled"] = True
+        workspace["automations"] = [{
+            "id": "inactive-1", "name": "Reabrir conversa", "enabled": True,
+            "trigger": "inactive_lead", "board": "Principal", "delay": 720,
+            "action": "prepare_followup",
+        }]
+        actions = worker.collect_due_actions(workspace, self.now)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["kind"], "automation")
+        self.assertEqual(actions[0]["dedupe_key"],
+                         f"inactive-1:lead-1:inactive_lead:{int(worker.timestamp(old))}")
+        workspace["manualApprovals"] = [{"ruleId": "inactive-1", "leadId": "lead-1",
+                                         "status": "pending"}]
         self.assertEqual(worker.collect_due_actions(workspace, self.now), [])
 
     def test_column_message_becomes_call_until_call_is_recorded(self):
@@ -194,6 +302,7 @@ class WorkerTests(unittest.TestCase):
         workspace["leads"].extend([
             self.lead(id="opted", optOut=True),
             self.lead(id="no-contact", doNotContact=True),
+            self.lead(id="legacy-opt-out", opt_out=True),
         ])
         workspace["ai"] = {"memoryRetentionDays": 180, "memories": [
             {"id": "keep", "leadId": "lead-1", "at": recent},
@@ -204,6 +313,7 @@ class WorkerTests(unittest.TestCase):
              (self.now + timedelta(days=30)).isoformat()},
             {"id": "opted", "leadId": "opted", "at": recent},
             {"id": "no-contact", "leadId": "no-contact", "at": recent},
+            {"id": "legacy-opt-out", "leadId": "legacy-opt-out", "at": recent},
             {"id": "removed", "leadId": "missing", "at": recent},
         ]}
         self.assertTrue(worker.prune_ai_memories(workspace, self.now))

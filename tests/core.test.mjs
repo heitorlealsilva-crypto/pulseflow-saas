@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {freshWorkspace,normalizeWorkspace,defaultCadence,phoneNumber,callRecorded,canContact,nextDue,taskList,dueReviewActions,columnAutomationActions,calendarEvent,leadsToCsv,parseLeadCsv,suggestions,escapeHTML,isUntouchedLegacySample} from '../core.mjs';
+import {freshWorkspace,normalizeWorkspace,defaultCadence,phoneNumber,callRecorded,isOptedOut,canContact,nextDue,taskList,dueReviewActions,columnAutomationActions,calendarEvent,leadsToCsv,parseLeadCsv,suggestions,contextualTips,escapeHTML,isUntouchedLegacySample} from '../core.mjs';
 const now=Date.now(),hour=3600000,day=hour*24;
 const base=()=>({id:'l1',name:'Ana',phone:'11912345678',board:'Principal',stage:'new',entered:now-day,messages:[],calls:[]});
 const called=()=>({...base(),calls:[{id:'c1',at:new Date(now-hour).toISOString(),outcome:'Não atendeu'}],lastContactAt:new Date(now-hour).toISOString()});
@@ -16,6 +16,7 @@ test('legacy callDone is not evidence of an actual call',()=>{assert.equal(callR
 test('first action is a call',()=>assert.equal(nextDue(base(),freshWorkspace(),now).type,'Ligação'));
 test('explicit schedule has priority',()=>{const l={...called(),nextDate:new Date(now+day).toISOString(),nextAction:'Reunião'};assert.equal(nextDue(l,freshWorkspace(),now).type,'Reunião')});
 test('no messages for opted-out, closed or postsale',()=>{for(const extra of [{optOut:true},{stage:'closed'},{board:'Pós-venda'}])assert.equal(nextDue({...called(),...extra},freshWorkspace(),now),null)});
+test('every stored opt-out spelling blocks contact, reminders and tips',()=>{for(const extra of [{optOut:true},{doNotContact:true},{opt_out:true}]){const lead={...called(),...extra,nextDate:new Date(now+day).toISOString()};assert.equal(isOptedOut(lead),true);assert.equal(canContact(lead),false);assert.equal(nextDue(lead,freshWorkspace(),now),null);assert.match(contextualTips(lead)[0],/não receber mensagens/)}});
 test('paused automation stays paused but explicit appointments remain',()=>{const l={...called(),automationPaused:true,stage:'waiting'};assert.equal(nextDue(l,freshWorkspace(),now),null);l.nextDate=new Date(now+day).toISOString();assert.ok(nextDue(l,freshWorkspace(),now))});
 test('recovery requires reason and an explicit date',()=>{const l={...called(),board:'Abandonados'};assert.equal(nextDue(l,freshWorkspace()),null);l.discardReason='Orçamento';assert.equal(nextDue(l,freshWorkspace()),null);l.recoveryAt=new Date(now+day).toISOString();assert.equal(nextDue(l,freshWorkspace()).at,now+day)});
 test('discarded leads never run ordinary column cadences before recovery',()=>{const w=freshWorkspace(),column=w.columns[0];column.automations={enabled:true,callFirst:true,cadence:[{id:'entry',trigger:'entry',delay:0,unit:'horas',action:'message',text:'Oi'}]};w.leads=[{...called(),board:'Abandonados',discardReason:'Agora não',recoveryAt:new Date(now+day).toISOString()}];assert.deepEqual(columnAutomationActions(w,now),[])});

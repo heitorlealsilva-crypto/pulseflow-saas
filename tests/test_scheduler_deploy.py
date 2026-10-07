@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class SchedulerDeployContractTests(unittest.TestCase):
     def test_workflow_is_frequent_oidc_only_and_never_handles_cron_secret(self):
         workflow = (ROOT / ".github/workflows/pulseflow-worker.yml").read_text(encoding="utf-8")
-        self.assertIn('cron: "*/30 * * * *"', workflow)
+        self.assertIn('cron: "7,37 * * * *"', workflow)
         self.assertIn("id-token: write", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("timeout-minutes: 5", workflow)

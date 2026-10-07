@@ -212,6 +212,11 @@ def redact(value, limit):
     return text.strip()
 
 
+def contact_opted_out(lead):
+    """Honor every persisted spelling of a do-not-contact preference."""
+    return bool(lead and any(lead.get(key) for key in ("optOut", "doNotContact", "opt_out")))
+
+
 def call_recorded(lead):
     return any(isinstance(item, dict) and item.get("id") and str(item.get("outcome", "")).strip()
                and str(item.get("outcome", "")).casefold() not in {"agendada", "cancelada", "scheduled", "cancelled"}
@@ -274,7 +279,7 @@ def build_context(db, organization_id, workspace, lead, trigger="manual", column
         retention_days = 180
     eligible_lead_ids = {str(item.get("id")) for item in (workspace.get("leads") or [])
                          if isinstance(item, dict) and item.get("id")
-                         and not item.get("optOut") and not item.get("doNotContact")}
+                         and not contact_opted_out(item)}
     previous = []
     if ai.get("learningEnabled") and eligible_lead_ids:
         previous = db.execute("""SELECT lead_id,result FROM ai_analyses WHERE organization_id=%s
@@ -530,7 +535,7 @@ def enforce_safety(value, lead):
         "observation_only": is_post_sale(lead),
         "requires_seller_approval": True,
     }
-    if lead.get("optOut") or lead.get("doNotContact") or is_post_sale(lead):
+    if contact_opted_out(lead) or is_post_sale(lead):
         clean["recommended_next_action"] = "none"
         clean["suggested_message"] = ""
     elif not call_recorded(lead):
@@ -661,7 +666,7 @@ class handler(BaseHTTPRequestHandler):
                 lead = next((item for item in workspace.get("leads", []) if str(item.get("id")) == lead_id), None)
                 if not lead:
                     raise AIError("Contato não encontrado nesta empresa.", "lead_not_found", 404)
-                if lead.get("optOut") or lead.get("doNotContact"):
+                if contact_opted_out(lead):
                     raise AIError("Este contato não permite análise de IA.", "contact_opted_out", 409)
                 if not (workspace.get("ai") or {}).get("enabled"):
                     raise AIError("Ative o agente desta empresa antes de analisar.", "agent_disabled", 409)

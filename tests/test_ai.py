@@ -266,12 +266,14 @@ class AITests(unittest.TestCase):
                     return [
                         {"lead_id": "active", "result": {"memory_facts": ["Prefere terça"]}},
                         {"lead_id": "opted-out", "result": {"memory_facts": ["Não reutilizar"]}},
+                        {"lead_id": "legacy-opt-out", "result": {"memory_facts": ["Também não reutilizar"]}},
                         {"lead_id": "removed", "result": {"memory_facts": ["Apagado"]}},
                     ]
                 return []
 
         workspace = {"ai": {"learningEnabled": True}, "leads": [
             {"id": "active"}, {"id": "opted-out", "optOut": True},
+            {"id": "legacy-opt-out", "opt_out": True},
         ]}
         lead = {"id": "active", "name": "Ana"}
         memories = ai.build_context(MemoryDB(), "org", workspace, lead)["prior_unverified_observations"]
@@ -354,13 +356,16 @@ class AITests(unittest.TestCase):
         self.assertEqual(result["suggested_message"], "")
 
     def test_opt_out_cannot_receive_model_suggestion(self):
-        lead = {"board": "Principal", "optOut": True, "calls": [{"id": "c1", "outcome": "Atendeu"}]}
-        result = ai.enforce_safety(sample_analysis(), lead)
-        self.assertEqual(result["recommended_next_action"], "none")
-        self.assertEqual(result["suggested_message"], "")
+        for preference in ("optOut", "doNotContact", "opt_out"):
+            with self.subTest(preference=preference):
+                lead = {"board": "Principal", preference: True,
+                        "calls": [{"id": "c1", "outcome": "Atendeu"}]}
+                result = ai.enforce_safety(sample_analysis(), lead)
+                self.assertEqual(result["recommended_next_action"], "none")
+                self.assertEqual(result["suggested_message"], "")
 
     def test_manual_analysis_rejects_opted_out_before_provider_call(self):
-        for preference in ("optOut", "doNotContact"):
+        for preference in ("optOut", "doNotContact", "opt_out"):
             with self.subTest(preference=preference):
                 class EndpointDB:
                     def __enter__(self):

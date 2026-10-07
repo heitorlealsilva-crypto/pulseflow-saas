@@ -49,10 +49,11 @@ export function normalizeWorkspace(raw){
  return result;
 }
 export function elapsed(since,now=Date.now()){const hours=Math.max(0,Math.floor((now-new Date(since).getTime())/3600000));return hours<1?'menos de 1h':hours<24?hours+'h':Math.floor(hours/24)+'d '+hours%24+'h'}
-export function canContact(l){return !!l&&!l.optOut&&l.stage!=='closed'&&l.board!=='Pós-venda'}
+export function isOptedOut(l){return !!(l?.optOut||l?.doNotContact||l?.opt_out)}
+export function canContact(l){return !!l&&!isOptedOut(l)&&l.stage!=='closed'&&l.board!=='Pós-venda'}
 export function callRecorded(l){return Array.isArray(l?.calls)&&l.calls.some(c=>c?.id&&c.at&&c.outcome&&!['agendada','cancelada','scheduled','planned','cancelled'].includes(String(c.outcome).toLowerCase())&&Number.isFinite(Date.parse(c.at))&&Date.parse(c.at)<=Date.now())}
 export function nextDue(l,w,now=Date.now()){
- if(!l||l.optOut||l.stage==='closed')return null;
+ if(!l||isOptedOut(l)||l.stage==='closed')return null;
  if(l.nextDate)return {at:new Date(l.nextDate).getTime(),type:l.nextAction||'Ligação',reason:'Agendamento'};
  if(!canContact(l))return null;
  if(l.automationPaused)return null;
@@ -119,5 +120,5 @@ export function parseLeadCsv(text,workspace=freshWorkspace()){
  if(rows.length>5001)errors.push('O limite é de 5.000 contatos por arquivo.');return {leads,skipped,errors:errors.slice(0,20)};
 }
 export function suggestions(niche,l={}){const name=(l.name||'{nome}').split(' ')[0];const topic={'Barbearia':'corte, barba ou os dois','Salão de beleza':'corte, cor ou tratamento','Clínica':'sua avaliação inicial','Loja':'o produto e o prazo que você procura','Imobiliária':'a região, o orçamento e o prazo da busca','Marketing e tráfego':'sua oferta, público e objetivo com os anúncios'}[niche];return [topic?`Oi, ${name}! Posso entender melhor seu interesse em ${topic}?`:`Oi, ${name}! Qual resultado você procura e o que é prioridade agora?`,l.discardReason?`${name}, quando conversamos, você mencionou ${l.discardReason}. Esse cenário mudou ou prefere retomar em outro momento?`:`${name}, ficou alguma dúvida sobre ${l.product||'o que conversamos'}? Posso ajudar a definir o próximo passo.`,`${name}, faz sentido marcarmos uma conversa breve para entender ${l.needs||'o que você precisa'} e avaliar os próximos passos?` ]}
-export function contextualTips(l){const tips=[];if(l.optOut)return ['Este contato pediu para não receber mensagens. Mantenha o acompanhamento pausado.'];if(!l.needs)tips.push('Pergunte: qual resultado você espera alcançar e por que isso importa agora?');if(!callRecorded(l))tips.push('Registre uma tentativa de ligação antes de preparar a primeira mensagem.');if(l.discardReason)tips.push('Confirme se o motivo do descarte ainda se aplica: '+l.discardReason+'.');if(l.product&&!l.contractValue)tips.push('Confirme escopo e expectativas antes de apresentar o investimento.');if(l.notes)tips.push('Use suas notas como contexto. Confirme com o cliente o que ainda estiver em aberto.');tips.push('Antes de sugerir uma reunião, confirme o objetivo, quem participa e a disponibilidade.');return tips.slice(0,4)}
+export function contextualTips(l){const tips=[];if(isOptedOut(l))return ['Este contato pediu para não receber mensagens. Mantenha o acompanhamento pausado.'];if(!l.needs)tips.push('Pergunte: qual resultado você espera alcançar e por que isso importa agora?');if(!callRecorded(l))tips.push('Registre uma tentativa de ligação antes de preparar a primeira mensagem.');if(l.discardReason)tips.push('Confirme se o motivo do descarte ainda se aplica: '+l.discardReason+'.');if(l.product&&!l.contractValue)tips.push('Confirme escopo e expectativas antes de apresentar o investimento.');if(l.notes)tips.push('Use suas notas como contexto. Confirme com o cliente o que ainda estiver em aberto.');tips.push('Antes de sugerir uma reunião, confirme o objetivo, quem participa e a disponibilidade.');return tips.slice(0,4)}
 export function messageData(m){return Array.isArray(m)?{direction:m[0],body:m[1],time:m[2],status:'registro anterior'}:m}

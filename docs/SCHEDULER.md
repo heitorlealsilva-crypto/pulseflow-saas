@@ -2,8 +2,8 @@
 
 ## O que fica automático
 
-O workflow `.github/workflows/pulseflow-worker.yml` chama a produção a cada 30
-minutos. Ele encontra compromissos, cadências, recuperações e regras vencidas e
+O workflow `.github/workflows/pulseflow-worker.yml` solicita uma chamada à produção
+nos minutos 7 e 37 de cada hora. Ele encontra compromissos, cadências, recuperações e regras vencidas e
 as coloca em **Aguardando sua decisão**. O trabalhador é idempotente e usa uma
 trava global: chamadas simultâneas não processam vários lotes ao mesmo tempo.
 O invocador faz um único POST com espera de até 120 segundos; se o resultado
@@ -12,8 +12,10 @@ chamada. Ele nunca envia mensagens; o vendedor continua responsável por
 revisar e autorizar cada envio.
 
 O cron diário configurado na Vercel continua ativo como contingência. Assim, o
-plano Hobby não precisa executar cron a cada 30 minutos e a aplicação não
-depende da precisão do cron diário para cadências em horas.
+plano Hobby não precisa executar cron a cada 30 minutos. Ainda assim, o GitHub
+pode atrasar ou descartar execuções; uma cadência em horas não equivale a uma
+garantia de aviso pontual com o navegador fechado. Ao abrir o sistema, as ações
+vencidas também são recuperadas.
 
 ## Autenticação sem segredo compartilhado
 
@@ -35,7 +37,7 @@ usado exclusivamente pelo fallback diário em `/api/worker`.
 1. Confirme que **GitHub Actions** está habilitado no repositório.
 2. Depois do deploy da branch `main`, abra **Actions → PulseFlow scheduler**.
 3. Use **Run workflow** uma vez e confirme a mensagem `Agendador concluído`.
-4. As execuções seguintes são programadas a cada 30 minutos.
+4. As execuções seguintes são solicitadas duas vezes por hora, sem garantia de horário.
 
 Em um repositório privado, essa frequência representa aproximadamente 1.440
 execuções mensais. Como o GitHub arredonda cada job para um minuto, ela cabe na
@@ -49,8 +51,9 @@ coincidirem.
 ## Limites reais
 
 GitHub Actions não oferece garantia de horário exato e uma execução programada
-pode atrasar em momentos de alta demanda. Para o PulseFlow, a precisão esperada
-é uma janela de aproximadamente 30 minutos, mais eventual atraso do GitHub. Se
-o produto passar a exigir SLA por minuto, será necessário um provedor dedicado
-de filas/agendamento. A fila persistente e as chaves de idempotência já permitem
-essa troca sem alterar as cadências dos clientes.
+pode atrasar ou ser descartada em momentos de alta demanda. Na verificação de
+produção, houve intervalo superior a seis horas entre duas execuções bem-sucedidas,
+apesar da programação semihorária. Portanto, **não anunciar SLA de 30 minutos**
+para lembretes com o navegador fechado. Para prazo confiável, será necessário um
+serviço de agendamento com garantia adequada; a fila persistente e as chaves de
+idempotência já permitem essa troca sem alterar as cadências dos clientes.

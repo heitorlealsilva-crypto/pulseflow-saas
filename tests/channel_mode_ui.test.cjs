@@ -21,6 +21,8 @@ const assert=require('node:assert/strict');
  await page.locator('.sidebar').waitFor();
  if(await page.locator('#business-form').count()){
   await page.locator('#business-form [name=businessName]').fill('Empresa modos QA');
+  await page.locator('#business-form button[type=submit]').click();
+  assert.equal(await page.locator('#business-form').count(),1,'cadastro inicial exige número antes de começar');
   await page.locator('#business-form [name=number]').fill('11912345678');
   await page.locator('#business-form button[type=submit]').click();
   await page.locator('#modal').waitFor({state:'detached'});

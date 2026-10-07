@@ -47,7 +47,7 @@ jobs:
         run: |
           npm install --no-save playwright@1.62.1
           npx playwright install --with-deps chromium
-      - name: Validar interface segura de webhooks
+      - name: Validar interface de webhooks e fluxo manual seguro
         run: |
           python3 tests/serve_test.py --test-only > /tmp/pulseflow-webhook-ui-server.log 2>&1 &
           server_pid=$!
@@ -58,4 +58,6 @@ jobs:
             fi
             sleep 0.25
           done
-          CI=1 node --test tests/webhook_ui.test.cjs
+          CI=1 node tests/webhook_ui.test.cjs
+          CI=1 node tests/channel_mode_ui.test.cjs
+          CI=1 node tests/mvp_safety_ui.test.cjs

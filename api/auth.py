@@ -722,6 +722,7 @@ class handler(BaseHTTPRequestHandler):
     def update_account(self, db, user, payload):
         organization_id = organization_uuid(payload.get("organization_id"))
         account = self.account(db, organization_id, locked=True)
+        previous_plan = account["plan"]
         changes = {}
         if "status" in payload:
             if payload["status"] not in ("active", "suspended"):
@@ -740,6 +741,22 @@ class handler(BaseHTTPRequestHandler):
             raise RequestError("informe uma alteração de conta")
         account.update(changes)
         db.execute("UPDATE organizations SET status=%s,plan=%s,permissions=%s::jsonb WHERE id=%s", (account["status"], account["plan"], json.dumps(account["permissions"]), organization_id))
+        if changes.get("plan") == "Base":
+            # The account lock serializes downgrade with member creation,
+            # invitations and reactivation. Reapplying Base repairs legacy
+            # accounts that still had active members from an earlier downgrade.
+            suspended = db.execute("""UPDATE users SET status='suspended'
+                WHERE organization_id=%s AND role='member' AND status='active'
+                RETURNING id""", (organization_id,)).fetchall()
+            revoked = db.execute("""DELETE FROM sessions WHERE user_id IN (
+                SELECT id FROM users WHERE organization_id=%s AND role='member')
+                RETURNING user_id""", (organization_id,)).fetchall()
+            self.audit(db, user, organization_id, "team.access.restricted_to_owner", {
+                "previous_plan": previous_plan,
+                "plan": "Base",
+                "suspended_user_ids": sorted(str(row["id"]) for row in suspended),
+                "revoked_sessions": len(revoked),
+            })
         webhooks_allowed = (account["status"] == "active"
                             and account["plan"] == "Equipe"
                             and account["permissions"].get("workspace_read", True))
@@ -767,11 +784,30 @@ class handler(BaseHTTPRequestHandler):
         status = payload.get("status")
         if status not in ("active", "suspended"):
             raise RequestError("status inválido")
-        target = db.execute("SELECT id,organization_id,role FROM users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        target = db.execute("SELECT id,organization_id,role,status FROM users WHERE id=%s", (user_id,)).fetchone()
         if not target:
             raise RequestError("usuário não encontrado", 404)
         if target["role"] == "super_admin":
             raise RequestError("o acesso de administradores globais não pode ser alterado aqui", 403)
+        organization_id = target["organization_id"]
+        # Match the organization -> user lock order used by team management;
+        # otherwise an admin reactivation could race past a downgrade.
+        account = self.account(db, organization_id, locked=True) if organization_id else None
+        target = db.execute("SELECT id,organization_id,role,status FROM users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        if not target:
+            raise RequestError("usuário não encontrado", 404)
+        if target["role"] == "super_admin":
+            raise RequestError("o acesso de administradores globais não pode ser alterado aqui", 403)
+        if target["organization_id"] != organization_id:
+            raise RequestError("a conta do usuário mudou; recarregue antes de continuar", 409)
+        if status == "active" and target["role"] != "owner":
+            if not account or account["status"] != "active" or account["plan"] != "Equipe":
+                raise RequestError("o plano atual não permite reativar este usuário", 409)
+            active = db.execute("""SELECT COUNT(*)::int AS count FROM users
+                WHERE organization_id=%s AND status='active' AND id<>%s""",
+                (organization_id, user_id)).fetchone()["count"]
+            if active >= 3:
+                raise RequestError("o plano Equipe permite até 3 usuários ativos", 409)
         db.execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
         if status == "suspended":
             db.execute("DELETE FROM sessions WHERE user_id=%s", (user_id,))

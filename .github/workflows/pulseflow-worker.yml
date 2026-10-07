@@ -3,7 +3,8 @@ name: PulseFlow scheduler
 on:
   schedule:
     # ~1,440 runs/month on a private repository, below the common 2,000 minute allowance.
-    - cron: "*/30 * * * *"
+    # Fora do início da hora, quando o GitHub concentra mais execuções.
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:

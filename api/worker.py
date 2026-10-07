@@ -74,7 +74,7 @@ def prune_ai_memories(workspace, now):
     allowed_leads = {
         str(lead.get("id")) for lead in (raw_leads if isinstance(raw_leads, list) else [])
         if isinstance(lead, dict) and lead.get("id")
-        and not lead.get("optOut") and not lead.get("doNotContact")
+        and not ai_service.contact_opted_out(lead)
     }
     retained = []
     for memory in original:
@@ -92,7 +92,7 @@ def prune_ai_memories(workspace, now):
 
 
 def can_contact(lead):
-    return bool(lead and not lead.get("optOut") and not lead.get("doNotContact")
+    return bool(lead and not ai_service.contact_opted_out(lead)
                 and lead.get("stage") != "closed" and not ai_service.is_post_sale(lead))
 
 
@@ -139,12 +139,20 @@ def collect_due_actions(workspace, now=None):
     now_ts = now.timestamp()
     actions = []
     leads = [lead for lead in workspace.get("leads", []) if isinstance(lead, dict) and lead.get("id")]
-    existing_runs = {str(run.get("key")) for run in workspace.get("automationRuns", [])
-                     if isinstance(run, dict) and run.get("key")}
+    prior_runs = [run for run in workspace.get("automationRuns", [])
+                  if isinstance(run, dict) and run.get("key")]
+    existing_runs = {str(run["key"]) for run in prior_runs}
+    pending_rule_leads = {
+        (str(item.get("ruleId")), str(item.get("leadId")))
+        for item in workspace.get("manualApprovals", [])
+        if isinstance(item, dict) and item.get("ruleId") and item.get("leadId")
+        and item.get("status") in {"pending", "reviewing"}
+    }
+    inactive_fallback_keys = {}
 
     # Explicit appointments, recovery and cadences work even without an AI model.
     for lead in leads:
-        if lead.get("optOut") or lead.get("doNotContact") or lead.get("stage") == "closed":
+        if ai_service.contact_opted_out(lead) or lead.get("stage") == "closed":
             continue
         lead_id = str(lead["id"])
         next_at = timestamp(lead.get("nextDate"))
@@ -194,6 +202,76 @@ def collect_due_actions(workspace, now=None):
                         f"Cadência · etapa {index + 1}",
                         "Faça a ligação e registre o resultado." if is_call else "Revise a mensagem antes de autorizar o envio.",
                         due, "" if is_call else text, kind="call" if is_call else "cadence"))
+                # Match the browser's nextDue priority: a pending cadence step
+                # takes precedence over a generic inactivity reminder.
+                continue
+
+        if lead.get("board") == "Principal":
+            raw_days = (workspace.get("settings") or {}).get("inactiveDays") or 30
+            try:
+                inactive_days = float(raw_days)
+                if not math.isfinite(inactive_days) or inactive_days <= 0:
+                    inactive_days = 30
+            except (TypeError, ValueError, OverflowError):
+                inactive_days = 30
+            last_contact = timestamp(lead.get("lastContactAt")) or timestamp(lead.get("entered"))
+            if last_contact is not None:
+                due = last_contact + inactive_days * 86400
+                if due <= now_ts:
+                    fallback_key = f"task:{lead_id}:Retomar contato:{int(due)}"
+                    actions.append(_action(
+                        fallback_key, lead,
+                        "Retomar contato", "Contato inativo. Revise o contexto antes de decidir.",
+                        due, followup_text(workspace, lead), kind="followup"))
+                    inactive_fallback_keys[lead_id] = fallback_key
+
+    # A column deadline is a durable review even when its optional AI and
+    # message cadence are disabled. Only the waiting column prepares a seller
+    # follow-up; other columns (including post-sale) receive a notification.
+    leads_with_due_actions = {action["lead_id"] for action in actions}
+    for lead in leads:
+        lead_id = str(lead["id"])
+        if (lead_id in leads_with_due_actions or ai_service.contact_opted_out(lead)
+                or lead.get("automationPaused") or lead.get("board") == "Abandonados"
+                or (lead.get("stage") == "closed" and not ai_service.is_post_sale(lead))):
+            continue
+        column = ai_service.column_for_lead(workspace, lead)
+        try:
+            limit_hours = float(column.get("limit") or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(limit_hours) or limit_hours <= 0:
+            continue
+        config = column.get("automations") if isinstance(column.get("automations"), dict) else {}
+        # A configured cadence or stage-timeout rule owns this deadline; do
+        # not add a second generic notification for the same lead and stage.
+        if config.get("enabled") and config.get("cadence"):
+            continue
+        if (workspace.get("ai") or {}).get("enabled") and any(
+                isinstance(rule, dict) and rule.get("enabled")
+                and rule.get("trigger") == "stage_timeout"
+                and rule.get("board") in (None, "", "Todos", lead.get("board"))
+                for rule in workspace.get("automations") or []):
+            continue
+        entered = timestamp(lead.get("entered"))
+        if entered is None:
+            continue
+        completed = timestamp(lead.get("lastTaskCompletedAt"))
+        anchor = max(entered, completed) if completed is not None else entered
+        due = anchor + limit_hours * 3600
+        if not math.isfinite(due) or due > now_ts:
+            continue
+        if lead.get("stage") == "waiting" and not ai_service.is_post_sale(lead):
+            actions.append(_action(
+                f"task:{lead_id}:Follow-up:{int(due)}", lead,
+                "Follow-up", "Aguardando resposta. Revise o contexto antes de retomar.",
+                due, followup_text(workspace, lead), kind="followup"))
+        else:
+            actions.append(_action(
+                f"column-timeout:{lead.get('board')}:{column.get('id')}:{lead_id}:{int(due)}",
+                lead, f"Revisar etapa · {column.get('name') or 'Contato'}",
+                "O prazo configurado para esta etapa foi atingido.", due,
+                kind="column_timeout", requires_approval=False))
 
     # Column-specific cadences are independent of the legacy global cadence.
     for lead in leads:
@@ -269,7 +347,6 @@ def collect_due_actions(workspace, now=None):
 
     # AI automation rules prepare reviews only while the tenant agent is active.
     if (workspace.get("ai") or {}).get("enabled"):
-        day = now.date().isoformat()
         columns = {str(c.get("id")): c for c in workspace.get("columns", []) if isinstance(c, dict)}
         for rule in workspace.get("automations") or []:
             if not isinstance(rule, dict) or not rule.get("enabled"):
@@ -283,18 +360,36 @@ def collect_due_actions(workspace, now=None):
                 board = rule.get("board")
                 if board and board != "Todos" and board != lead.get("board"):
                     continue
-                base = timestamp(lead.get("entered")) or now_ts
+                base = timestamp(lead.get("entered"))
+                if base is None:
+                    continue
                 if trigger == "stage_timeout":
                     column = columns.get(str(lead.get("stage"))) or {}
                     hours = float(rule.get("delay") or column.get("limit") or 24)
                     due = base + max(0, hours) * 3600
                 else:
-                    base = timestamp(lead.get("lastContactAt")) or base
+                    last_contact = timestamp(lead.get("lastContactAt"))
+                    if last_contact is not None:
+                        base = last_contact
                     due = base + max(0, float(rule.get("delay") or 720)) * 3600
                 if due > now_ts:
                     continue
-                run_key = f"{rule.get('id')}:{lead.get('id')}:{day}"
-                if run_key in existing_runs:
+                lead_id = str(lead.get("id"))
+                if trigger == "inactive_lead" and lead_id in inactive_fallback_keys:
+                    fallback_key = inactive_fallback_keys.pop(lead_id)
+                    actions = [action for action in actions
+                               if action["dedupe_key"] != fallback_key]
+                rule_id = str(rule.get("id"))
+                run_key = f"{rule_id}:{lead_id}:{trigger}:{int(base)}"
+                legacy_prefix = f"{rule_id}:{lead_id}:"
+                legacy_run_after_anchor = any(
+                    str(run["key"]).startswith(legacy_prefix)
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}",
+                                     str(run["key"])[len(legacy_prefix):])
+                    and (timestamp(run.get("at")) or 0) >= base
+                    for run in prior_runs)
+                if (run_key in existing_runs or legacy_run_after_anchor
+                        or (rule_id, lead_id) in pending_rule_leads):
                     continue
                 actions.append(_action(
                     run_key, lead, str(rule.get("name") or "Automação"),
@@ -425,7 +520,7 @@ def queue_ai_observations(db, organization_id, workspace, now,
     previous_by_lead = {str(row["lead_id"]): row for row in rows}
     leads = [lead for lead in workspace.get("leads", [])
              if isinstance(lead, dict) and lead.get("id")
-             and not lead.get("optOut") and not lead.get("doNotContact")
+             and not ai_service.contact_opted_out(lead)
              and not (lead.get("stage") == "closed" and not ai_service.is_post_sale(lead))
              and ai_service.observation_policy(workspace, lead)["enabled"]]
     # Oldest/never-observed leads come first. A handful of noisy contacts can
@@ -580,7 +675,7 @@ def _process_ai_job_unprotected(db, job, now):
         finish_ai_job(db, job["id"], "skipped", "source_unavailable")
         return "skipped"
     policy = ai_service.observation_policy(workspace, lead)
-    if not policy["enabled"] or lead.get("optOut") or lead.get("doNotContact"):
+    if not policy["enabled"] or ai_service.contact_opted_out(lead):
         finish_ai_job(db, job["id"], "skipped", "observation_disabled")
         return "skipped"
     context = ai_service.build_context(
@@ -620,7 +715,7 @@ def _process_ai_job_unprotected(db, job, now):
     current_context = ai_service.build_context(
         db, job["organization_id"], current, current_lead, job["trigger"], current_policy["column"])
     if (not current_policy["enabled"] or ai_service.context_hash(current_context) != job["input_hash"]
-            or current_lead.get("optOut") or current_lead.get("doNotContact")):
+            or ai_service.contact_opted_out(current_lead)):
         db.rollback()
         job["_quota_error_code"] = "stale_input"
         finish_ai_job(db, job["id"], "skipped", "stale_input")
