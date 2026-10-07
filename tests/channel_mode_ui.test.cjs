@@ -80,12 +80,16 @@ const assert=require('node:assert/strict');
  await page.evaluate(()=>document.querySelector('.sidebar [data-page=settings]').click());
  await page.locator('[data-settings=channel]').click();
  await page.locator('[data-action=official-mode]').click();
+ await page.getByText('Envio oficial selecionado. Cada mensagem ainda exige aprovação.').waitFor();
+ const officialWorkspace=await page.evaluate(async()=>{const me=await fetch('/api/auth?action=me').then(response=>response.json());return fetch('/api/auth?action=workspace&organization_id='+encodeURIComponent(me.account.id)).then(response=>response.json())});
+ assert.equal(officialWorkspace.workspace.whatsapp.mode,'official','a escolha oficial precisa estar salva antes do envio');
+ assert.equal(officialWorkspace.workspace.leads.find(item=>item.name==='Resposta manual QA').pendingManual,undefined,'o envio manual anterior precisa estar confirmado');
  await page.evaluate(()=>document.querySelector('.sidebar [data-page=conversations]').click());
  assert((await page.locator('#composer button[type=submit]').innerText()).includes('Aprovar e enviar'));
  await page.locator('#message-input').fill('Mensagem oficial aprovada pelo vendedor.');
-  const sendResponse=page.waitForResponse(response=>response.url().includes('/api/whatsapp?action=send'));
+ const sendResponse=page.waitForResponse(response=>response.url().includes('/api/whatsapp?action=send'),{timeout:10000});
  await page.locator('#composer button[type=submit]').click();
-  await sendResponse;
+ try{assert.equal((await sendResponse).status(),200)}catch(error){const diagnostic=await page.evaluate(()=>({notices:[...document.querySelectorAll('.toast,.form-error,#sync-error')].map(item=>item.textContent.trim()).filter(Boolean),composer:document.querySelector('#composer')?.textContent.trim(),message:document.querySelector('#message-input')?.value,saveState:document.querySelector('#save-state')?.textContent.trim()}));throw new Error('O envio oficial não chegou ao endpoint: '+JSON.stringify(diagnostic),{cause:error})}
  await page.waitForFunction(()=>document.querySelector('#message-input')?.value==='');
  assert.equal(officialSends,1);
  assert.deepEqual(errors,[]);
